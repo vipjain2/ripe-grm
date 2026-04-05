@@ -1,18 +1,20 @@
-"""Training dashboard — spawn, monitor and manage MJX PPO training runs."""
+"""Training dashboard — app entry point, tick loop, UI composition, and Tasks-tab actions."""
 
 import json
 import os
-import signal
-import queue
 import re
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
-from ripe_autotrain.compute_backend_client import BackendClient, JobConfig, JobHandle, GPU
+from ripe_autotrain.compute_backend_client import GPU, JobConfig
+from ripe_autotrain.dashboard_backend import init_backends, live_jobs
+from ripe_autotrain.dashboard_experiments import (
+    ExperimentsMixin, _load_defaults,
+)
+from ripe_autotrain.dashboard_train_runs import TrainingRun, SpawnModal
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -20,7 +22,6 @@ from textual.widgets import (
     Button, DataTable, Footer, Header, Input, Label, Log,
     Static, TabbedContent, TabPane,
 )
-from textual.screen import ModalScreen
 
 _TRAINING_DIR    = Path.cwd()
 BACKEND_REGISTRY = _TRAINING_DIR / "compute_registry.json"
@@ -36,276 +37,17 @@ def _load_project_config() -> tuple[Path | None, Path | None]:
 
 _OUTPUT_DIR, _LOG_DIR = _load_project_config()
 
-def _read_registry() -> list[dict]:
-    if not BACKEND_REGISTRY.exists():
-        raise FileNotFoundError(f"Backend registry not found: {BACKEND_REGISTRY}")
-    return json.loads(BACKEND_REGISTRY.read_text())
+_backends, _backend_by_id, _gpus, N_GPUS = init_backends()
 
-
-def _backend_responsive(sock_path: str) -> bool:
-    try:
-        BackendClient(sock_path).info()
-        return True
-    except Exception:
-        return False
-
-
-def _kill_existing_backend(script: str) -> None:
-    """Kill any running processes whose cmdline contains the script name."""
-    try:
-        result = subprocess.run(
-            ["pgrep", "-f", script],
-            capture_output=True, text=True,
-        )
-        pids = [int(p) for p in result.stdout.split() if p.strip()]
-        for pid in pids:
-            if pid == os.getpid():
-                continue
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
-                pass
-        if pids:
-            time.sleep(0.5)   # give processes a moment to exit
-    except Exception:
-        pass
-
-
-def _start_backend_servers() -> None:
-    """Kill any existing backend processes and relaunch from the registry.
-    Each backend type has its own script (local_backend.py, vast_backend.py, …).
-    """
-    base = Path(__file__).parent
-    for entry in _read_registry():
-        script = entry.get("script")
-        if not script:
-            continue
-        _kill_existing_backend(script)
-        subprocess.Popen(
-            [sys.executable, str(base / script),
-             entry["sock_path"],
-             entry.get("backend_id", "local")],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-
-def _connect_backends() -> list[BackendClient]:
-    """Wait for each backend socket then return a BackendClient per entry."""
-    clients = []
-    for entry in _read_registry():
-        sock_path = entry["sock_path"]
-        deadline  = time.time() + 10.0
-        while not _backend_responsive(sock_path):
-            if time.time() > deadline:
-                break
-            time.sleep(0.1)
-        clients.append(BackendClient(sock_path))
-    return clients
-
-
-def _live_jobs() -> dict[str, JobHandle]:
-    return {h.run_name: h for h in (j for b in _backends for j in b.running_jobs())}
-
-
-_start_backend_servers()
-_backends:      list[BackendClient]      = _connect_backends()
-_backend_infos: list[dict]              = [b.info() for b in _backends]
-_backend_by_id: dict[str, BackendClient] = {
-    info["backend_id"]: b for b, info in zip(_backends, _backend_infos)
-}
-_gpus: list[GPU] = [g for b in _backends for g in b.discover_gpus()]
-N_GPUS = len(_gpus)
 STATE_FILE  = _TRAINING_DIR / "runs_state.json"
-QUEUE_FILE  = _TRAINING_DIR / "experiments.json"
 CONFIG_FILE = _TRAINING_DIR / "dashboard_config.json"
 LOG_DIR     = Path("/tmp/drl_runs")
-
-_params_file = _TRAINING_DIR / "default_params.json"
-
-def _load_defaults() -> dict:
-    return json.loads(_params_file.read_text()) if _params_file.exists() else {}
-
-
-# ---------------------------------------------------------------------------
-# TrainingRun
-# ---------------------------------------------------------------------------
-@dataclass
-class TrainingRun:
-    run_name:   str
-    gpu_id:     int | None
-    params:     dict = field(default_factory=dict)
-    handle:     JobHandle | None = None
-    start_time: float = field(default_factory=time.time)
-    stopped_at: float | None = None
-    log_lines:  list[str] = field(default_factory=list)
-    log_queue:  queue.Queue = field(default_factory=queue.Queue)
-    status:     str = "running"
-    steps:      int = 0
-    steps_offset: int = 0
-    log_file:   str = ""
-    chain_experiment:  str | None = None
-    chain_task_idx:    int = 0
-    chain_total_tasks: int = 1
-
-
-    @property
-    def elapsed(self) -> str:
-        if self.status == "running":
-            end = time.time()
-        else:
-            end = self.stopped_at if self.stopped_at is not None else self.start_time
-        s = int(end - self.start_time)
-        h, rem = divmod(s, 3600)
-        m, sec = divmod(rem, 60)
-        return f"{h:02d}:{m:02d}:{sec:02d}"
-
-    @property
-    def device_label(self) -> str:
-        if self.gpu_id is None:
-            return "CPU"
-        if self.handle and hasattr(self.handle, "backend_id"):
-            return f"GPU({self.handle.backend_id}, {self.gpu_id})"
-        return f"GPU {self.gpu_id}"
-
-    def is_alive(self) -> bool:
-        return self.handle.is_running() if self.handle else False
-
-    def terminate(self) -> None:
-        if self.handle:
-            self.handle.cancel()
-
-    def start_reader(self) -> None:
-        if self.handle:
-            self.log_queue = self.handle.open_log_reader()
-
-    def drain_queue(self) -> list[str]:
-        lines = []
-        try:
-            while True:
-                item = self.log_queue.get_nowait()
-                if item is None:
-                    break
-                lines.append(item)
-        except queue.Empty:
-            pass
-        return lines
-
-
-# ---------------------------------------------------------------------------
-# Modals
-# ---------------------------------------------------------------------------
-def _collect_params(modal: ModalScreen) -> dict:
-    """Collect all param fields from a modal generically, casting to the type of the default."""
-    result = {}
-    for key, default_val in _load_defaults().items():
-        raw = modal.query_one(f"#param-{key}", Input).value.strip()
-        val = raw if raw else default_val
-        result[key] = int(float(val)) if isinstance(default_val, int) else float(val)
-    return result
-
-
-class SpawnModal(ModalScreen):
-    BINDINGS = [("escape", "dismiss", "Cancel")]
-
-    def __init__(self, next_gpu: int | None):
-        super().__init__()
-        self._next_gpu = next_gpu
-
-    def compose(self) -> ComposeResult:
-        default_device = str(self._next_gpu) if self._next_gpu is not None else "0"
-        with Vertical(id="spawn-dialog"):
-            yield Label("Spawn MJX Training Run", id="spawn-title")
-            yield Label("run_name")
-            yield Input(placeholder=f"run_{int(time.time())}", id="run-name")
-            yield Label(f"gpu_id  (0–{N_GPUS-1})")
-            yield Input(value=default_device, id="gpu-id")
-            for key, val in _load_defaults().items():
-                yield Label(key)
-                yield Input(value=str(val), id=f"param-{key}")
-            with Horizontal(id="spawn-buttons"):
-                yield Button("Spawn", variant="success", id="spawn-confirm")
-                yield Button("Cancel", variant="error", id="spawn-cancel")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "spawn-cancel":
-            self.dismiss(None)
-            return
-        try:
-            gpu_id = max(0, min(int(self.query_one("#gpu-id", Input).value), N_GPUS - 1))
-        except ValueError:
-            gpu_id = 0
-        result = _collect_params(self)
-        result["run_name"] = self.query_one("#run-name", Input).value or f"run_{int(time.time())}"
-        result["gpu_id"]   = gpu_id
-        self.dismiss(result)
-
-
-class QueueModal(ModalScreen):
-    """Add an experiment to the queue, optionally with chained tasks."""
-    BINDINGS = [
-        Binding("ctrl+s", "confirm", "Add to Queue"),
-        Binding("escape", "dismiss", "Cancel"),
-    ]
-
-    def __init__(self):
-        super().__init__()
-        self._num_tasks = 1
-
-    def compose(self) -> ComposeResult:
-        yield Footer()
-        with Vertical(id="spawn-dialog"):
-            yield Label("Add Experiment to Queue", id="spawn-title")
-            yield Label("run_name")
-            yield Input(placeholder=f"exp_{int(time.time())}", id="run-name")
-            with Vertical(id="tasks-container"):
-                yield Label("── Task 1", markup=False, id="task-label-0")
-                for key, val in _load_defaults().items():
-                    yield Label(key)
-                    yield Input(value=str(val), id=f"task0-param-{key}")
-
-    def action_confirm(self) -> None:
-        defaults = _load_defaults()
-        tasks = []
-        for t in range(self._num_tasks):
-            task_params = {}
-            for key, default_val in defaults.items():
-                raw = self.query_one(f"#task{t}-param-{key}", Input).value.strip()
-                val = raw if raw else default_val
-                task_params[key] = int(float(val)) if isinstance(default_val, int) else float(val)
-            tasks.append(task_params)
-        result = {
-            "run_name": self.query_one("#run-name", Input).value or f"exp_{int(time.time())}",
-            "tasks": tasks,
-        }
-        self.dismiss(result)
-
-
-
-
-class AddStepModal(ModalScreen):
-    """Add a step to an existing queued experiment."""
-    BINDINGS = [
-        Binding("ctrl+s", "confirm", "Add Step"),
-        Binding("escape", "dismiss", "Cancel"),
-    ]
-
-    def compose(self) -> ComposeResult:
-        yield Footer()
-        with Vertical(id="spawn-dialog"):
-            yield Label("Add Step to Experiment", id="spawn-title")
-            for key, val in _load_defaults().items():
-                yield Label(key)
-                yield Input(value=str(val), id=f"param-{key}")
-
-    def action_confirm(self) -> None:
-        self.dismiss(_collect_params(self))
 
 
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
-class Dashboard(App):
+class Dashboard(App, ExperimentsMixin):
     TITLE = "AutoTrain"
     CSS = """
     TabbedContent { height: 1fr; }
@@ -375,7 +117,7 @@ class Dashboard(App):
                         yield DataTable(id="runs-table", cursor_type="row")
                     with Vertical(id="right-panel"):
                         yield Label(" Log Output", markup=False)
-                        yield Log(id="log-view", auto_scroll=True)
+                        yield Log(id="log-view", auto_scroll=False)
             with TabPane("GPU Status", id="tab-gpu"):
                 with Vertical(id="gpu-panel"):
                     yield Static("", id="gpu-status")
@@ -477,7 +219,7 @@ class Dashboard(App):
             return
         with open(STATE_FILE) as f:
             state = json.load(f)
-        live = _live_jobs()
+        live = live_jobs(_backends)
         seen = {r.run_name for r in self.runs}
         for entry in state:
             run_name = entry["run_name"]
@@ -503,7 +245,7 @@ class Dashboard(App):
 
     def _load_existing_runs(self) -> None:
         seen = {r.run_name for r in self.runs}
-        live = _live_jobs()
+        live = live_jobs(_backends)
         if _OUTPUT_DIR:
             ckpts = sorted(_OUTPUT_DIR.glob("*.msgpack"), key=lambda p: p.stat().st_mtime) if _OUTPUT_DIR.exists() else []
         else:
@@ -532,22 +274,17 @@ class Dashboard(App):
                 run.start_reader()
             seen.add(run_name)
 
-    def _save_queue(self) -> None:
-        with open(QUEUE_FILE, "w") as f:
-            json.dump(self.experiment_queue, f, indent=2)
-
-    def _load_queue(self) -> None:
-        if not QUEUE_FILE.exists():
-            return
-        with open(QUEUE_FILE) as f:
-            self.experiment_queue = json.load(f)
-
     # -----------------------------------------------------------------------
     # Helpers
     # -----------------------------------------------------------------------
     def _free_gpu(self) -> "GPU | None":
         used = {r.gpu_id for r in self.runs if r.status == "running" and r.gpu_id is not None}
         return next((g for g in _gpus if g.index not in used), None)
+
+    def _gpu_by_index(self, idx: int | None) -> "GPU | None":
+        if idx is None:
+            return None
+        return next((g for g in _gpus if g.index == idx), None)
 
     def _checkpoints(self, run_name: str) -> list[Path]:
         if _OUTPUT_DIR or _LOG_DIR:
@@ -557,88 +294,63 @@ class Dashboard(App):
             return candidates
         return list(_TRAINING_DIR.rglob(f"{run_name}*.msgpack"))
 
-    def _maybe_start_next_experiment(self) -> None:
-        if not self.experiment_queue:
-            return
-        gpu = self._free_gpu()
-        if gpu is None:
-            return
-        config = self.experiment_queue.pop(0)
-        config["gpu_id"] = gpu.index
-        self._on_spawn_result(config)
-        self._save_queue()
-        self._refresh_queue_table()
-        self.notify(f"Auto-started {config['run_name']} on GPU {gpu.index}", timeout=5)
+    # -----------------------------------------------------------------------
+    # Tick helpers
+    # -----------------------------------------------------------------------
+    def _process_run(self, run: TrainingRun) -> tuple[list[str], bool]:
+        """Drain the run's log queue, parse state, detect errors/stops.
 
-    def _spawn_chain_task(self, run: "TrainingRun") -> None:
-        next_idx = run.chain_task_idx + 1
-        exp = next((e for e in self.experiment_queue if e.get("run_name") == run.chain_experiment), None)
-        if exp is None:
-            return
-        tasks = exp.get("tasks") or [exp]
-        if next_idx >= len(tasks):
-            return
-        candidates = self._checkpoints(run.run_name)
-        checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
-        gpu = next((g for g in _gpus if g.index == run.gpu_id), None) or self._free_gpu()
-        if gpu is None:
-            self.notify(f"No GPU available for chain step {next_idx + 1}", severity="error")
-            return
-        launch_config = {
-            **tasks[next_idx],
-            "run_name":   run.run_name,
-            "gpu_id":     gpu.index,
-            "checkpoint": checkpoint,
-        }
-        self.runs.remove(run)
-        self._on_spawn_result(launch_config)
-        new_run = self.runs[-1]
-        new_run.chain_experiment  = run.chain_experiment
-        new_run.chain_task_idx    = next_idx
-        new_run.chain_total_tasks = run.chain_total_tasks
-        self.notify(
-            f"{run.run_name}: step {next_idx + 1}/{run.chain_total_tasks} started",
-            timeout=5,
-        )
-
-    def _tick(self) -> None:
-        log_widget = self.query_one("#log-view", Log)
+        Returns (new_lines, state_dirty).
+        """
         state_dirty = False
-        for i, run in enumerate(self.runs):
-            new_lines = run.drain_queue()
-            run.log_lines.extend(new_lines)
+        new_lines = run.drain_queue()
+        run.log_lines.extend(new_lines)
 
-            for line in new_lines:
-                m = re.search(r"steps=\s*([\d,]+)", line)
-                if m:
-                    run.steps = int(m.group(1).replace(",", ""))
+        for line in new_lines:
+            m = re.search(r"steps=\s*([\d,]+)", line)
+            if m:
+                run.steps = int(m.group(1).replace(",", ""))
+                state_dirty = True
+
+        for line in new_lines:
+            if "Traceback (most recent call last)" in line or "Error:" in line:
+                if run.is_alive():
+                    run.terminate()
+                    run.status = "error"
+                    run.stopped_at = time.time()
+                    run.log_lines.append("[dashboard] Error detected — process terminated.")
                     state_dirty = True
 
-            for line in new_lines:
-                if "Traceback (most recent call last)" in line or "Error:" in line:
-                    if run.is_alive():
-                        run.terminate()
-                        run.status = "error"
-                        run.stopped_at = time.time()
-                        run.log_lines.append("[dashboard] Error detected — process terminated.")
-                        state_dirty = True
+        if run.status == "running" and not run.is_alive():
+            run.status = "stopped"
+            run.stopped_at = time.time()
+            state_dirty = True
+            if run.chain_experiment and run.chain_task_idx + 1 < run.chain_total_tasks:
+                self.call_after_refresh(lambda r=run: self._spawn_chain_task(r))
 
-            if run.status == "running" and not run.is_alive():
-                run.status = "stopped"
-                run.stopped_at = time.time()
-                state_dirty = True
-                if run.chain_experiment and run.chain_task_idx + 1 < run.chain_total_tasks:
-                    self.call_after_refresh(lambda r=run: self._spawn_chain_task(r))
+        return new_lines, state_dirty
 
-            if run.run_name == self.selected_run_name and new_lines:
-                at_bottom = log_widget.scroll_y >= log_widget.virtual_size.height - log_widget.size.height - 1
-                scroll_y = log_widget.scroll_y
-                for line in new_lines:
-                    log_widget.write_line(line)
-                if at_bottom:
-                    log_widget.scroll_end(animate=False)
-                else:
-                    log_widget.scroll_to(y=scroll_y, animate=False)
+    def _update_log_view(self, new_lines: list[str], log_widget: Log) -> None:
+        """Write new lines to the log widget, preserving scroll position."""
+        if not new_lines:
+            return
+        at_bottom = log_widget.scroll_y >= log_widget.virtual_size.height - log_widget.size.height - 3
+        scroll_y = log_widget.scroll_y
+        for line in new_lines:
+            log_widget.write_line(line)
+        if at_bottom:
+            log_widget.scroll_end(animate=False)
+        else:
+            log_widget.scroll_to(y=scroll_y, animate=False)
+
+    def _tick(self) -> None:
+        log_widget  = self.query_one("#log-view", Log)
+        state_dirty = False
+        for run in self.runs:
+            new_lines, dirty = self._process_run(run)
+            state_dirty = state_dirty or dirty
+            if run.run_name == self.selected_run_name:
+                self._update_log_view(new_lines, log_widget)
 
         if state_dirty:
             self._save_state()
@@ -687,44 +399,43 @@ class Dashboard(App):
         return "yes" if self._checkpoints(run.run_name) else "-"
 
     def _refresh_table(self) -> None:
+        from textual.coordinate import Coordinate
         table = self.query_one("#runs-table", DataTable)
-        scroll_x, scroll_y = table.scroll_x, table.scroll_y
-        self._rebuilding_table = True
-        table.clear()
         sorted_runs = sorted(self.runs, key=lambda r: r.status != "running")
+        current_keys = [r.run_name for r in sorted_runs]
         new_selected = -1
-        for i, run in enumerate(sorted_runs):
-            total = run.steps if run.steps else run.steps_offset
-            table.add_row(
-                run.run_name, run.device_label,
-                (run.handle.id if run.handle else "-"),
-                run.status, run.elapsed,
-                f"{total:,}" if total else "-",
-                self._has_checkpoint(run),
-            )
-            if run.run_name == self.selected_run_name:
-                new_selected = i
-        self.selected_idx = new_selected
-        if new_selected >= 0:
-            table.move_cursor(row=new_selected)
-        table.scroll_to(x=scroll_x, y=scroll_y, animate=False)
-        self.call_after_refresh(lambda: setattr(self, "_rebuilding_table", False))
 
-    def _refresh_queue_table(self) -> None:
-        table = self.query_one("#queue-table", DataTable)
-        table.clear()
-        defaults = _load_defaults()
-        for exp in self.experiment_queue:
-            tasks = exp.get("tasks") or [exp]
-            task1 = tasks[0]
-            changed = ", ".join(
-                f"{k}={task1[k]}" for k in defaults
-                if k in task1 and task1[k] != defaults[k]
-            )
-            suffix = f"  [{len(tasks)} steps]" if len(tasks) > 1 else ""
-            table.add_row(exp.get("run_name", "-"), (changed or "(defaults)") + suffix)
-        if 0 <= self.selected_queue_idx < len(self.experiment_queue):
-            table.move_cursor(row=self.selected_queue_idx)
+        if current_keys != getattr(self, "_table_run_keys", None):
+            # Structure changed — full rebuild needed
+            scroll_x, scroll_y = table.scroll_x, table.scroll_y
+            self._rebuilding_table = True
+            table.clear()
+            for i, run in enumerate(sorted_runs):
+                total = run.steps if run.steps else run.steps_offset
+                table.add_row(
+                    run.run_name, run.device_label,
+                    (run.handle.id if run.handle else "-"),
+                    run.status, run.elapsed,
+                    f"{total:,}" if total else "-",
+                    self._has_checkpoint(run),
+                )
+                if run.run_name == self.selected_run_name:
+                    new_selected = i
+            self._table_run_keys = current_keys
+            if new_selected >= 0:
+                table.move_cursor(row=new_selected)
+            table.scroll_to(x=scroll_x, y=scroll_y, animate=False)
+            self.call_after_refresh(lambda: setattr(self, "_rebuilding_table", False))
+        else:
+            # Same rows — update only changing cells in-place (no clear, no scroll disruption)
+            for i, run in enumerate(sorted_runs):
+                total = run.steps if run.steps else run.steps_offset
+                table.update_cell_at(Coordinate(i, 3), run.status)
+                table.update_cell_at(Coordinate(i, 4), run.elapsed)
+                table.update_cell_at(Coordinate(i, 5), f"{total:,}" if total else "-")
+                if run.run_name == self.selected_run_name:
+                    new_selected = i
+            self.selected_idx = new_selected
 
     def _show_run(self, idx: int) -> None:
         sorted_runs = sorted(self.runs, key=lambda r: r.status != "running")
@@ -739,6 +450,7 @@ class Dashboard(App):
         log.clear()
         for line in run.log_lines[-500:]:
             log.write_line(line)
+        log.scroll_end(animate=False)
 
     # -----------------------------------------------------------------------
     # Events
@@ -786,7 +498,7 @@ class Dashboard(App):
     # -----------------------------------------------------------------------
     def action_spawn(self) -> None:
         gpu = self._free_gpu()
-        self.push_screen(SpawnModal(gpu.index if gpu is not None else 0), self._on_spawn_result)
+        self.push_screen(SpawnModal(gpu.index if gpu is not None else 0, N_GPUS), self._on_spawn_result)
 
     def _on_spawn_result(self, config: dict | None) -> None:
         if config is None:
@@ -915,73 +627,6 @@ class Dashboard(App):
                 cwd=_TRAINING_DIR,
             )
             self.notify("TensorBoard started at http://localhost:6006", timeout=5)
-
-    # -----------------------------------------------------------------------
-    # Actions — Experiments tab
-    # -----------------------------------------------------------------------
-    def action_add_to_queue(self) -> None:
-        self.push_screen(QueueModal(), self._on_queue_result)
-
-    def _on_queue_result(self, config: dict | None) -> None:
-        if config is None:
-            return
-        self.experiment_queue.append(config)
-        self._save_queue()
-        self._refresh_queue_table()
-        self.notify(f"Queued {config['run_name']}", timeout=3)
-
-    def action_add_step(self) -> None:
-        if self.selected_queue_idx < 0 or self.selected_queue_idx >= len(self.experiment_queue):
-            self.notify("No experiment selected.", severity="warning")
-            return
-        self.push_screen(AddStepModal(), self._on_add_step_result)
-
-    def _on_add_step_result(self, params: dict | None) -> None:
-        if params is None:
-            return
-        exp = self.experiment_queue[self.selected_queue_idx]
-        if "tasks" not in exp:
-            flat = {k: v for k, v in exp.items() if k in _load_defaults()}
-            exp["tasks"] = [flat]
-        exp["tasks"].append(params)
-        self._save_queue()
-        self._refresh_queue_table()
-        self.notify(f"Added step {len(exp['tasks'])} to {exp['run_name']}", timeout=3)
-
-    def action_remove_from_queue(self) -> None:
-        if self.selected_queue_idx < 0 or self.selected_queue_idx >= len(self.experiment_queue):
-            return
-        removed = self.experiment_queue.pop(self.selected_queue_idx)
-        self.selected_queue_idx = min(self.selected_queue_idx, len(self.experiment_queue) - 1)
-        self._save_queue()
-        self._refresh_queue_table()
-        self.notify(f"Removed {removed['run_name']} from queue", timeout=3)
-
-    def action_submit_queue(self) -> None:
-        self._submit_selected()
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "queue-submit":
-            self._submit_selected()
-
-    def _submit_selected(self) -> None:
-        if self.selected_queue_idx < 0 or self.selected_queue_idx >= len(self.experiment_queue):
-            self.notify("No experiment selected.", severity="warning")
-            return
-        exp = self.experiment_queue[self.selected_queue_idx]
-        gpu = self._free_gpu()
-        if gpu is None:
-            self.notify("No free GPU available.", severity="error")
-            return
-        tasks = exp.get("tasks") or [exp]
-        launch_config = {**tasks[0], "run_name": exp["run_name"], "gpu_id": gpu.index}
-        self._on_spawn_result(launch_config)
-        if len(tasks) > 1:
-            new_run = self.runs[-1]
-            new_run.chain_experiment  = exp["run_name"]
-            new_run.chain_task_idx    = 0
-            new_run.chain_total_tasks = len(tasks)
-        self.notify(f"Submitted {exp['run_name']} on GPU {gpu.index}", timeout=5)
 
     # -----------------------------------------------------------------------
     # Quit
