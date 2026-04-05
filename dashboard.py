@@ -117,7 +117,7 @@ _backend_by_id: dict[str, BackendClient] = {
 _gpus: list[GPU] = [g for b in _backends for g in b.discover_gpus()]
 N_GPUS = len(_gpus)
 STATE_FILE  = _TRAINING_DIR / "runs_state.json"
-QUEUE_FILE  = _TRAINING_DIR / "experiment_queue.json"
+QUEUE_FILE  = _TRAINING_DIR / "experiments.json"
 CONFIG_FILE = _TRAINING_DIR / "dashboard_config.json"
 LOG_DIR     = Path("/tmp/drl_runs")
 
@@ -144,6 +144,9 @@ class TrainingRun:
     steps:      int = 0
     steps_offset: int = 0
     log_file:   str = ""
+    chain_experiment:  str | None = None
+    chain_task_idx:    int = 0
+    chain_total_tasks: int = 1
 
 
     @property
@@ -239,28 +242,64 @@ class SpawnModal(ModalScreen):
 
 
 class QueueModal(ModalScreen):
-    """Add an experiment to the queue."""
-    BINDINGS = [("escape", "dismiss", "Cancel")]
+    """Add an experiment to the queue, optionally with chained tasks."""
+    BINDINGS = [
+        Binding("ctrl+s", "confirm", "Add to Queue"),
+        Binding("escape", "dismiss", "Cancel"),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self._num_tasks = 1
 
     def compose(self) -> ComposeResult:
+        yield Footer()
         with Vertical(id="spawn-dialog"):
             yield Label("Add Experiment to Queue", id="spawn-title")
             yield Label("run_name")
             yield Input(placeholder=f"exp_{int(time.time())}", id="run-name")
+            with Vertical(id="tasks-container"):
+                yield Label("── Task 1", markup=False, id="task-label-0")
+                for key, val in _load_defaults().items():
+                    yield Label(key)
+                    yield Input(value=str(val), id=f"task0-param-{key}")
+
+    def action_confirm(self) -> None:
+        defaults = _load_defaults()
+        tasks = []
+        for t in range(self._num_tasks):
+            task_params = {}
+            for key, default_val in defaults.items():
+                raw = self.query_one(f"#task{t}-param-{key}", Input).value.strip()
+                val = raw if raw else default_val
+                task_params[key] = int(float(val)) if isinstance(default_val, int) else float(val)
+            tasks.append(task_params)
+        result = {
+            "run_name": self.query_one("#run-name", Input).value or f"exp_{int(time.time())}",
+            "tasks": tasks,
+        }
+        self.dismiss(result)
+
+
+
+
+class AddStepModal(ModalScreen):
+    """Add a step to an existing queued experiment."""
+    BINDINGS = [
+        Binding("ctrl+s", "confirm", "Add Step"),
+        Binding("escape", "dismiss", "Cancel"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Footer()
+        with Vertical(id="spawn-dialog"):
+            yield Label("Add Step to Experiment", id="spawn-title")
             for key, val in _load_defaults().items():
                 yield Label(key)
                 yield Input(value=str(val), id=f"param-{key}")
-            with Horizontal(id="spawn-buttons"):
-                yield Button("Add to Queue", variant="success", id="queue-confirm")
-                yield Button("Cancel", variant="error", id="queue-cancel")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "queue-cancel":
-            self.dismiss(None)
-            return
-        result = _collect_params(self)
-        result["run_name"] = self.query_one("#run-name", Input).value or f"exp_{int(time.time())}"
-        self.dismiss(result)
+    def action_confirm(self) -> None:
+        self.dismiss(_collect_params(self))
 
 
 # ---------------------------------------------------------------------------
@@ -278,16 +317,21 @@ class Dashboard(App):
     #log-view { height: 1fr; }
     #gpu-panel { padding: 1 2; }
     #gpu-status { height: auto; }
-    SpawnModal, QueueModal { align: center middle; }
+    #queue-actions { height: 3; align: right middle; padding: 0 2; }
+    #queue-submit { width: auto; min-width: 16; }
+    SpawnModal { align: center middle; }
     #spawn-dialog {
-        width: 52; height: auto;
+        width: 52; height: 80vh;
         border: thick $primary;
         background: $surface;
         padding: 1 2;
     }
+    #tasks-container { height: 1fr; overflow-y: auto; }
     #spawn-title { text-align: center; text-style: bold; margin-bottom: 1; }
     #spawn-buttons { margin-top: 1; height: auto; align: center middle; }
     """
+
+    ENABLE_COMMAND_PALETTE = False
 
     BINDINGS = [
         Binding("n", "spawn",        "New run"),
@@ -296,8 +340,11 @@ class Dashboard(App):
         Binding("d", "delete",       "Delete selected"),
         Binding("t", "tensorboard",  "TensorBoard"),
         Binding("r", "render",       "Render"),
-        Binding("a", "add_to_queue", "Add experiment"),
+        Binding("a", "add_to_queue",      "Add experiment"),
         Binding("x", "remove_from_queue", "Remove experiment"),
+        Binding("e", "add_step",          "Extend"),
+        Binding("s", "submit_queue",      "Submit queue"),
+        Binding("ctrl+p", "command_palette", "Palette"),
         Binding("ctrl+c", "quit",    "Quit", priority=True),
         Binding("q", "quit",         "Quit"),
     ]
@@ -318,8 +365,9 @@ class Dashboard(App):
         with TabbedContent():
             with TabPane("Experiments", id="tab-experiments"):
                 with Vertical():
-                    yield Label(" Experiment Queue  (auto-starts when GPU is free)", markup=False)
                     yield DataTable(id="queue-table", cursor_type="row")
+                    with Horizontal(id="queue-actions"):
+                        yield Button("Submit", id="queue-submit", variant="success")
             with TabPane("Tasks", id="tab-tasks"):
                 with Horizontal(id="main"):
                     with Vertical(id="left-panel"):
@@ -338,13 +386,12 @@ class Dashboard(App):
         runs_table.add_columns("Name", "Device", "ID", "Status", "Elapsed", "Steps", "Ckpt")
 
         queue_table = self.query_one("#queue-table", DataTable)
-        queue_table.add_columns("Name", *_load_defaults().keys())
+        queue_table.add_columns("Name", "Changed Params")
 
         self._load_config()
         self._load_state()
         self._load_existing_runs()
         self._load_queue()
-        self._refresh_queue_table()
         self.set_interval(1.0, self._tick)
 
     # -----------------------------------------------------------------------
@@ -362,12 +409,15 @@ class Dashboard(App):
     def _save_state(self) -> None:
         state = [
             {
-                "run_name":     run.run_name,
-                "gpu_id":       run.gpu_id,
-                "log_file":     run.log_file,
-                "start_time":   run.start_time,
-                "steps":        run.steps,
-                "steps_offset": run.steps_offset,
+                "run_name":          run.run_name,
+                "gpu_id":            run.gpu_id,
+                "log_file":          run.log_file,
+                "start_time":        run.start_time,
+                "steps":             run.steps,
+                "steps_offset":      run.steps_offset,
+                "chain_experiment":  run.chain_experiment,
+                "chain_task_idx":    run.chain_task_idx,
+                "chain_total_tasks": run.chain_total_tasks,
             }
             for run in self.runs if run.status == "running"
         ]
@@ -433,15 +483,18 @@ class Dashboard(App):
             run_name = entry["run_name"]
             handle   = live.get(run_name)
             run = TrainingRun(
-                run_name     = run_name,
-                gpu_id       = entry.get("gpu_id"),
-                params       = self._params_for_run(run_name),
-                handle       = handle,
-                start_time   = entry.get("start_time", time.time()),
-                status       = "running" if handle else "stopped",
-                steps        = entry.get("steps", 0),
-                steps_offset = entry.get("steps_offset", 0),
-                log_file     = entry.get("log_file", ""),
+                run_name          = run_name,
+                gpu_id            = entry.get("gpu_id"),
+                params            = self._params_for_run(run_name),
+                handle            = handle,
+                start_time        = entry.get("start_time", time.time()),
+                status            = "running" if handle else "stopped",
+                steps             = entry.get("steps", 0),
+                steps_offset      = entry.get("steps_offset", 0),
+                log_file          = entry.get("log_file", ""),
+                chain_experiment  = entry.get("chain_experiment"),
+                chain_task_idx    = entry.get("chain_task_idx", 0),
+                chain_total_tasks = entry.get("chain_total_tasks", 1),
             )
             self.runs.append(run)
             seen.add(run_name)
@@ -517,6 +570,37 @@ class Dashboard(App):
         self._refresh_queue_table()
         self.notify(f"Auto-started {config['run_name']} on GPU {gpu.index}", timeout=5)
 
+    def _spawn_chain_task(self, run: "TrainingRun") -> None:
+        next_idx = run.chain_task_idx + 1
+        exp = next((e for e in self.experiment_queue if e.get("run_name") == run.chain_experiment), None)
+        if exp is None:
+            return
+        tasks = exp.get("tasks") or [exp]
+        if next_idx >= len(tasks):
+            return
+        candidates = self._checkpoints(run.run_name)
+        checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
+        gpu = next((g for g in _gpus if g.index == run.gpu_id), None) or self._free_gpu()
+        if gpu is None:
+            self.notify(f"No GPU available for chain step {next_idx + 1}", severity="error")
+            return
+        launch_config = {
+            **tasks[next_idx],
+            "run_name":   run.run_name,
+            "gpu_id":     gpu.index,
+            "checkpoint": checkpoint,
+        }
+        self.runs.remove(run)
+        self._on_spawn_result(launch_config)
+        new_run = self.runs[-1]
+        new_run.chain_experiment  = run.chain_experiment
+        new_run.chain_task_idx    = next_idx
+        new_run.chain_total_tasks = run.chain_total_tasks
+        self.notify(
+            f"{run.run_name}: step {next_idx + 1}/{run.chain_total_tasks} started",
+            timeout=5,
+        )
+
     def _tick(self) -> None:
         log_widget = self.query_one("#log-view", Log)
         state_dirty = False
@@ -543,6 +627,8 @@ class Dashboard(App):
                 run.status = "stopped"
                 run.stopped_at = time.time()
                 state_dirty = True
+                if run.chain_experiment and run.chain_task_idx + 1 < run.chain_total_tasks:
+                    self.call_after_refresh(lambda r=run: self._spawn_chain_task(r))
 
             if run.run_name == self.selected_run_name and new_lines:
                 at_bottom = log_widget.scroll_y >= log_widget.virtual_size.height - log_widget.size.height - 1
@@ -557,7 +643,6 @@ class Dashboard(App):
         if state_dirty:
             self._save_state()
 
-        self._maybe_start_next_experiment()
         self._refresh_table()
         self._refresh_gpu_status()
 
@@ -628,11 +713,16 @@ class Dashboard(App):
     def _refresh_queue_table(self) -> None:
         table = self.query_one("#queue-table", DataTable)
         table.clear()
+        defaults = _load_defaults()
         for exp in self.experiment_queue:
-            table.add_row(
-                exp.get("run_name", "-"),
-                *[str(exp.get(k, "-")) for k in _load_defaults()],
+            tasks = exp.get("tasks") or [exp]
+            task1 = tasks[0]
+            changed = ", ".join(
+                f"{k}={task1[k]}" for k in defaults
+                if k in task1 and task1[k] != defaults[k]
             )
+            suffix = f"  [{len(tasks)} steps]" if len(tasks) > 1 else ""
+            table.add_row(exp.get("run_name", "-"), (changed or "(defaults)") + suffix)
         if 0 <= self.selected_queue_idx < len(self.experiment_queue):
             table.move_cursor(row=self.selected_queue_idx)
 
@@ -659,13 +749,15 @@ class Dashboard(App):
             self._active_tab = "tab-tasks"
         elif tab_id.endswith("tab-experiments"):
             self._active_tab = "tab-experiments"
+            self._load_queue()
+            self._refresh_queue_table()
         elif tab_id.endswith("tab-gpu"):
             self._active_tab = "tab-gpu"
         self.refresh_bindings()
 
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         tasks_only       = {"spawn", "continue_run", "kill", "delete", "tensorboard", "render"}
-        experiments_only = {"add_to_queue", "remove_from_queue"}
+        experiments_only = {"add_to_queue", "remove_from_queue", "add_step", "submit_queue"}
         gpu_hidden       = tasks_only | experiments_only
         if self._active_tab == "tab-gpu" and action in gpu_hidden:
             return False
@@ -838,6 +930,24 @@ class Dashboard(App):
         self._refresh_queue_table()
         self.notify(f"Queued {config['run_name']}", timeout=3)
 
+    def action_add_step(self) -> None:
+        if self.selected_queue_idx < 0 or self.selected_queue_idx >= len(self.experiment_queue):
+            self.notify("No experiment selected.", severity="warning")
+            return
+        self.push_screen(AddStepModal(), self._on_add_step_result)
+
+    def _on_add_step_result(self, params: dict | None) -> None:
+        if params is None:
+            return
+        exp = self.experiment_queue[self.selected_queue_idx]
+        if "tasks" not in exp:
+            flat = {k: v for k, v in exp.items() if k in _load_defaults()}
+            exp["tasks"] = [flat]
+        exp["tasks"].append(params)
+        self._save_queue()
+        self._refresh_queue_table()
+        self.notify(f"Added step {len(exp['tasks'])} to {exp['run_name']}", timeout=3)
+
     def action_remove_from_queue(self) -> None:
         if self.selected_queue_idx < 0 or self.selected_queue_idx >= len(self.experiment_queue):
             return
@@ -847,9 +957,39 @@ class Dashboard(App):
         self._refresh_queue_table()
         self.notify(f"Removed {removed['run_name']} from queue", timeout=3)
 
+    def action_submit_queue(self) -> None:
+        self._submit_selected()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "queue-submit":
+            self._submit_selected()
+
+    def _submit_selected(self) -> None:
+        if self.selected_queue_idx < 0 or self.selected_queue_idx >= len(self.experiment_queue):
+            self.notify("No experiment selected.", severity="warning")
+            return
+        exp = self.experiment_queue[self.selected_queue_idx]
+        gpu = self._free_gpu()
+        if gpu is None:
+            self.notify("No free GPU available.", severity="error")
+            return
+        tasks = exp.get("tasks") or [exp]
+        launch_config = {**tasks[0], "run_name": exp["run_name"], "gpu_id": gpu.index}
+        self._on_spawn_result(launch_config)
+        if len(tasks) > 1:
+            new_run = self.runs[-1]
+            new_run.chain_experiment  = exp["run_name"]
+            new_run.chain_task_idx    = 0
+            new_run.chain_total_tasks = len(tasks)
+        self.notify(f"Submitted {exp['run_name']} on GPU {gpu.index}", timeout=5)
+
     # -----------------------------------------------------------------------
     # Quit
     # -----------------------------------------------------------------------
+    async def action_command_palette(self) -> None:
+        from textual.command import CommandPalette
+        await self.push_screen(CommandPalette())
+
     def action_quit(self) -> None:
         self._save_state()
         if self._tb_process and self._tb_process.poll() is None:
