@@ -6,7 +6,7 @@ rsync, and starts training via SSH. Common server infrastructure lives in
 compute_backend_server.py.
 
 Requires:
-  - vastai SDK:  pip install vastai
+  - vastai SDK:  pip install vastai-sdk
   - API key:     VAST_API_KEY environment variable
 
 compute_registry.json entry:
@@ -35,7 +35,7 @@ import threading
 import time
 from pathlib import Path
 
-from vastai import VastAI
+from vastai_sdk import VastAI
 
 from ripe_autotrain.compute_backend_client import SocketJobHandle
 from ripe_autotrain.compute_backend_server import _BackendServer, _BaseGPUServer
@@ -43,13 +43,6 @@ from ripe_autotrain.compute_backend_server import _BackendServer, _BaseGPUServer
 DEFAULT_VAST_SOCK = "/tmp/drl_vast_backend.sock"
 _REGISTRY_PATH   = Path.cwd() / "compute_registry.json"
 
-# SSH options applied to every connection
-_SSH_OPTS = [
-    "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null",
-    "-o", "LogLevel=ERROR",
-    "-o", "ConnectTimeout=10",
-]
 
 
 # ---------------------------------------------------------------------------
@@ -61,16 +54,32 @@ def _sdk() -> VastAI:
     local = _sdk._local
     if not hasattr(local, "client"):
         api_key = os.environ.get("VAST_API_KEY", "")
-        local.client = VastAI(api_key=api_key, raw=True)
+        if not api_key:
+            _key_file = Path.home() / ".config" / "vastai" / "vast_api_key"
+            if _key_file.exists():
+                api_key = _key_file.read_text().strip()
+        local.client = VastAI(api_key=api_key)
     return local.client
 
 _sdk._local = threading.local()
 
 
+def _parse_response(result) -> list | dict | None:
+    """Normalise SDK responses: return Python object regardless of str/dict/list."""
+    if isinstance(result, (list, dict)):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            return None
+    return None
+
+
 def _show_instances() -> list[dict]:
-    """Return list of all instances. SDK raw=True returns list[dict] directly."""
+    """Return list of all instances."""
     try:
-        result = _sdk().show_instances(quiet=False)
+        result = _parse_response(_sdk().show_instances())
         return result if isinstance(result, list) else []
     except Exception:
         return []
@@ -79,12 +88,21 @@ def _show_instances() -> list[dict]:
 def _get_instance(instance_id: str) -> dict | None:
     """Return instance info dict, or None if not found."""
     try:
-        result = _sdk().show_instance(id=int(instance_id))
+        result = _parse_response(_sdk().show_instance(id=int(instance_id)))
         if isinstance(result, dict) and result.get("id"):
             return result
         return None
     except Exception:
         return None
+
+
+def _execute(instance_id: str, cmd: str, timeout: int = 30) -> str:
+    """Run a command on a Vast.ai instance via SDK. Returns stdout string."""
+    result = _sdk().execute(int(instance_id), cmd)
+    if isinstance(result, str):
+        return result.strip()
+    parsed = _parse_response(result)
+    return str(parsed).strip() if parsed else ""
 
 
 def _wait_for_running(instance_id: str, timeout: int = 300) -> dict:
@@ -93,33 +111,25 @@ def _wait_for_running(instance_id: str, timeout: int = 300) -> dict:
     while time.time() < deadline:
         instances = _show_instances()
         info = next((i for i in instances if str(i["id"]) == instance_id), None)
-        if info and info.get("actual_status") == "running" and info.get("ssh_port"):
+        if info and info.get("actual_status") == "running":
             return info
         time.sleep(5)
     raise TimeoutError(f"Instance {instance_id} did not start within {timeout}s")
 
 
-def _ssh(host: str, port: int, cmd: str, timeout: int = 30) -> str:
-    """Run a command on the remote instance, return stdout."""
-    result = subprocess.run(
-        ["ssh", f"-p{port}", *_SSH_OPTS, f"root@{host}", cmd],
-        capture_output=True, text=True, timeout=timeout,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip())
-    return result.stdout.strip()
-
-
-def _wait_for_ssh(host: str, port: int, timeout: int = 120) -> None:
-    """Poll until SSH accepts connections."""
+def _wait_for_execute(instance_id: str, timeout: int = 120) -> None:
+    """Poll until execute API accepts commands on the instance."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            _ssh(host, port, "echo ok", timeout=10)
-            return
+            out = _execute(instance_id, "echo ok", timeout=10)
+            if "ok" in out:
+                return
         except Exception:
-            time.sleep(5)
-    raise TimeoutError(f"SSH {host}:{port} not ready within {timeout}s")
+            pass
+        time.sleep(5)
+    raise TimeoutError(f"Instance {instance_id} not ready for commands within {timeout}s")
+
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +151,6 @@ class _VastGPUServer(_BaseGPUServer):
         super().__init__(slot_id, f"Vast Slot {slot_id}", f"/tmp/drl_vast_{slot_id}.sock")
         self._backend:        "VastBackend"  = backend
         self._instance_id:   str | None      = None
-        self._ssh_host:      str | None      = None
-        self._ssh_port:      int | None      = None
         self._remote_log:    str | None      = None
         self._cost_per_hour: float           = 0.0
         self._total_cost:    float           = 0.0
@@ -170,8 +178,6 @@ class _VastGPUServer(_BaseGPUServer):
 
     def _on_job_ended(self) -> None:
         self._instance_id    = None
-        self._ssh_host       = None
-        self._ssh_port       = None
         self._remote_log     = None
         self._cost_per_hour  = 0.0
         self._instance_alive  = False
@@ -191,23 +197,19 @@ class _VastGPUServer(_BaseGPUServer):
         info = _get_instance(job_id)
         if not info or info.get("actual_status") != "running":
             return None
-        ssh_host = info.get("ssh_host") or info.get("public_ipaddr")
-        ssh_port = int(info.get("ssh_port") or 22)
         # Check training process is actually running — instance alive != job alive
         training_alive = False
         try:
-            out = _ssh(ssh_host, ssh_port,
-                       f"pgrep -fa 'train.py' | grep -- '--run-name {run_name}'",
-                       timeout=15)
+            out = _execute(job_id,
+                           f"pgrep -fa 'train.py' | grep -- '--run-name {run_name}'",
+                           timeout=15)
             training_alive = bool(out.strip())
         except Exception:
-            training_alive = True  # SSH failed; assume alive, poll will correct
+            training_alive = True  # execute failed; assume alive, poll will correct
         if not training_alive:
             return None
         with self._lock:
             self._instance_id    = job_id
-            self._ssh_host       = ssh_host
-            self._ssh_port       = ssh_port
             self._remote_log     = log_file
             self._run_name       = run_name
             self._log_file       = self._local_log
@@ -255,8 +257,6 @@ class _VastGPUServer(_BaseGPUServer):
         """
         with self._lock:
             instance_id      = self._instance_id
-            ssh_host         = self._ssh_host
-            ssh_port         = self._ssh_port
             remote_log       = self._remote_log
             run_name         = self._run_name or ""
             was_inst_alive   = self._instance_alive
@@ -283,17 +283,17 @@ class _VastGPUServer(_BaseGPUServer):
                     if self._absent_polls >= 2:
                         self._instance_alive = False
 
-        if not (ssh_host and ssh_port) or not is_alive:
+        if not is_alive:
             return
 
         # 2. Training process alive check via pgrep
         try:
-            out = _ssh(ssh_host, ssh_port,
-                       f"pgrep -fa 'train.py' | grep -- '--run-name {run_name}'",
-                       timeout=10)
+            out = _execute(instance_id,
+                           f"pgrep -fa 'train.py' | grep -- '--run-name {run_name}'",
+                           timeout=10)
             process_found = bool(out.strip())
         except Exception:
-            process_found = True  # SSH error; keep current state, poll will retry
+            process_found = True  # execute error; keep current state, poll will retry
 
         with self._lock:
             if self._instance_id == instance_id:
@@ -310,9 +310,9 @@ class _VastGPUServer(_BaseGPUServer):
         # 3. Discover remote log path when not yet known
         if not remote_log and run_name:
             try:
-                found = _ssh(ssh_host, ssh_port,
-                             f"ls -t /root/project/logs/{run_name}*.log 2>/dev/null | head -1",
-                             timeout=10).strip()
+                found = _execute(instance_id,
+                                 f"ls -t /root/project/logs/{run_name}*.log 2>/dev/null | head -1",
+                                 timeout=10).strip()
                 remote_log = found or "/var/log/onstart.log"
                 with self._lock:
                     if self._instance_id == instance_id:
@@ -325,33 +325,33 @@ class _VastGPUServer(_BaseGPUServer):
 
         # 4. Fetch new log lines while training is alive
         if is_training_alive:
-            self._fetch_log_lines(ssh_host, ssh_port, remote_log)
+            self._fetch_log_lines(instance_id, remote_log)
 
         # 5. Final download when training just confirmed ended; signal log complete
         training_just_ended = was_train_alive and not is_training_alive
         if training_just_ended:
-            self._fetch_log_lines(ssh_host, ssh_port, remote_log, final=True)
+            self._fetch_log_lines(instance_id, remote_log, final=True)
             self._log_complete = True
 
         # 6. Instance died: final download + log complete
         inst_just_died = was_inst_alive and not is_alive and self._absent_polls >= 2
         if inst_just_died and not self._log_complete:
-            self._fetch_log_lines(ssh_host, ssh_port, remote_log, final=True)
+            self._fetch_log_lines(instance_id, remote_log, final=True)
             self._log_complete = True
 
         # 7. nvidia-smi — only when instance alive and enough time has passed
         if time.time() - self._last_status_t >= self._STATUS_MIN_SECS:
-            self._refresh_status_cache(ssh_host, ssh_port)
+            self._refresh_status_cache(instance_id)
             self._last_status_t = time.time()
 
-    def _fetch_log_lines(self, host: str, port: int, remote_log: str,
+    def _fetch_log_lines(self, instance_id: str, remote_log: str,
                          final: bool = False) -> None:
-        """SSH tail to fetch lines since _log_offset; append to local log file."""
+        """Fetch log lines since _log_offset via execute; append to local log file."""
         timeout = 30 if final else 10
         try:
-            out = _ssh(host, port,
-                       f"tail -n +{self._log_offset + 1} {remote_log} 2>/dev/null",
-                       timeout=timeout)
+            out = _execute(instance_id,
+                           f"tail -n +{self._log_offset + 1} {remote_log} 2>/dev/null",
+                           timeout=timeout)
             if out:
                 new_lines = out.splitlines()
                 with open(self._local_log, "a") as f:
@@ -361,11 +361,11 @@ class _VastGPUServer(_BaseGPUServer):
         except Exception:
             pass
 
-    def _refresh_status_cache(self, host: str, port: int) -> None:
+    def _refresh_status_cache(self, instance_id: str) -> None:
         """Fetch nvidia-smi from the instance and update the cached status."""
         try:
-            out = _ssh(
-                host, port,
+            out = _execute(
+                instance_id,
                 "nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,"
                 "memory.used,memory.total --format=csv,noheader,nounits",
                 timeout=12,
@@ -405,22 +405,19 @@ class _VastGPUServer(_BaseGPUServer):
             remote_log = f"/root/project/logs/{log_name}"
 
             with self._lock:
-                ssh_host    = self._ssh_host
-                ssh_port    = self._ssh_port
                 instance_id = self._instance_id
 
-            if not (ssh_host and ssh_port and instance_id):
+            if not instance_id:
                 raise RuntimeError("No instance attached to this slot — attach one first.")
 
-            # 1. Sync project files to /root/project/
-            subprocess.run([
-                "rsync", "-az", "--delete",
-                "-e", f"ssh -p {ssh_port} {' '.join(_SSH_OPTS)}",
-                str(self._backend.project_root) + "/",
-                f"root@{ssh_host}:/root/project/",
-            ], check=True)
+            # 1. Copy training files to /root/project/ via SDK
+            project_root = self._backend.project_root
+            for fname in ("train.py", "policy.py", "default_params.json"):
+                src = project_root / fname
+                if src.exists():
+                    _sdk().copy(str(src), f"{instance_id}:/root/project/{fname}")
 
-            # 2. Build training command and launch in the background
+            # 2. Build training command and launch in the background via SDK execute
             cmd = (
                 f"cd /root/project"
                 f" && mkdir -p logs"
@@ -432,7 +429,7 @@ class _VastGPUServer(_BaseGPUServer):
             if chk:
                 cmd += f" --checkpoint {chk}"
             cmd += f" > {remote_log} 2>&1 &"
-            _ssh(ssh_host, ssh_port, cmd)
+            _execute(instance_id, cmd)
 
             # 3. Update server state (poll thread will start fetching logs/status)
             Path(self._local_log).unlink(missing_ok=True)  # fresh file for new job
@@ -454,20 +451,15 @@ class _VastGPUServer(_BaseGPUServer):
     def _cmd_cancel(self, conn) -> None:
         with self._lock:
             instance_id = self._instance_id
-            ssh_host    = self._ssh_host
-            ssh_port    = self._ssh_port
             run_name    = self._run_name
         try:
             if not instance_id:
                 conn.sendall(b"error no job running\n")
                 return
-            if not (ssh_host and ssh_port):
-                conn.sendall(b"error no ssh connection to instance\n")
-                return
             # Kill only the training process — leave the instance running
-            _ssh(ssh_host, ssh_port,
-                 f"pkill -f 'train.py.*--run-name {run_name}'",
-                 timeout=15)
+            _execute(instance_id,
+                     f"pkill -f 'train.py.*--run-name {run_name}'",
+                     timeout=15)
             conn.sendall(b"ok\n")
         except Exception as e:
             conn.sendall(f"error {e}\n".encode())
@@ -575,30 +567,26 @@ class VastBackend:
                 idle.start()
                 self._servers[slot_id] = idle
 
-            ssh_host = info.get("ssh_host") or info.get("public_ipaddr")
-            ssh_port = int(info.get("ssh_port") or 22)
-
             # Discover run name from the running training process
-            run_name = info.get("label") or f"instance-{info['id']}"
+            instance_id_str = str(info["id"])
+            run_name = info.get("label") or f"instance-{instance_id_str}"
             training_found = False
             try:
-                ps_out = _ssh(ssh_host, ssh_port,
-                              "ps -eo args | grep 'train.py' | grep -v grep | head -1",
-                              timeout=10)
+                ps_out = _execute(instance_id_str,
+                                  "ps -eo args | grep 'train.py' | grep -v grep | head -1",
+                                  timeout=10)
                 parts = ps_out.split()
                 training_found = bool(parts)
                 if "--run-name" in parts:
                     run_name = parts[parts.index("--run-name") + 1]
             except Exception:
-                continue  # SSH failed during discovery — skip and retry next cycle
+                continue  # execute failed during discovery — skip and retry next cycle
 
             if not training_found:
                 continue  # instance alive but no training process — skip
 
             with idle._lock:
-                idle._instance_id     = str(info["id"])
-                idle._ssh_host        = ssh_host
-                idle._ssh_port        = ssh_port
+                idle._instance_id     = instance_id_str
                 idle._cost_per_hour   = float(info.get("dph_total", 0.0))
                 idle._run_name        = run_name
                 idle._log_file        = idle._local_log
