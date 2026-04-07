@@ -344,28 +344,43 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
 
     def _refresh_gpu_status_bg(self) -> None:
         self._refresh_gpus()
-        lines = []
-        for gpu in self._gpus:
+
+        # Group GPUs by backend_id, preserving order of first appearance
+        groups: dict[str, list] = {}
+        for g in self._gpus:
+            groups.setdefault(getattr(g, "backend_id", "local"), []).append(g)
+
+        def _gpu_line(gpu) -> str:
             try:
                 s = gpu.status()
             except Exception as e:
-                lines.append(f"{gpu.name:<20s}  [red]{e}[/red]")
-                continue
+                return f"{gpu.name:<20s}  [red]{e}[/red]"
+            instance_id = getattr(gpu, "instance_id", None)
+            total_cost  = getattr(gpu, "total_cost", 0.0)
+            id_str      = f"  ID: {instance_id}" if instance_id else ""
             if s.mem_total_mb == 0:
                 cost_str = f"  ${gpu.cost_per_hour:.2f}/hr" if gpu.cost_per_hour > 0 else ""
-                lines.append(f"{gpu.name:<20s}  [dim]idle — no instance{cost_str}[/dim]")
-                continue
+                return f"{gpu.name:<20s}  [dim]idle — no instance{cost_str}{id_str}[/dim]"
             bar_filled = s.util_pct // 5
             bar        = "█" * bar_filled + "░" * (20 - bar_filled)
             temp_color = "red" if s.temp_c >= 80 else "yellow" if s.temp_c >= 70 else "green"
             cost_str   = f"  ${gpu.cost_per_hour:.2f}/hr" if gpu.cost_per_hour > 0 else ""
-            lines.append(
+            total_str  = f"  total: ${total_cost:.2f}" if total_cost > 0 else ""
+            return (
                 f"{gpu.name:<20s}  "
                 f"[cyan]{bar}[/cyan] {s.util_pct:3d}%  "
                 f"[{temp_color}]{s.temp_c:3d}°C[/{temp_color}]  "
                 f"Mem: {s.mem_used_mb:5d}/{s.mem_total_mb:5d} MiB"
-                f"{cost_str}"
+                f"{cost_str}{total_str}{id_str}"
             )
+
+        lines = []
+        for backend_id, gpus in groups.items():
+            if lines:
+                lines.append("")
+            lines.append(f"[bold]{backend_id}[/bold]")
+            lines.extend(_gpu_line(g) for g in gpus)
+
         if lines:
             self.call_from_thread(
                 self.query_one("#gpu-status", Static).update, "\n".join(lines)

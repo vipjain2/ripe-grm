@@ -145,6 +145,7 @@ class _VastGPUServer(_BaseGPUServer):
         self._ssh_port:      int | None      = None
         self._remote_log:    str | None      = None
         self._cost_per_hour: float           = 0.0
+        self._total_cost:    float           = 0.0
         self._instance_alive: bool           = False
         self._absent_polls:  int             = 0
         self._training_alive: bool           = False  # training process running on instance
@@ -219,6 +220,16 @@ class _VastGPUServer(_BaseGPUServer):
             self._log_complete   = False
         return self._make_handle()
 
+    # -- Discover extra fields -----------------------------------------------
+
+    def _discover_extra(self) -> dict:
+        with self._lock:
+            return {
+                "cost_per_hour": self._cost_per_hour,
+                "instance_id":   self._instance_id,
+                "total_cost":    self._total_cost,
+            }
+
     # -- Override _cmd_info to report actual cost ----------------------------
 
     def _cmd_info(self, conn) -> None:
@@ -263,6 +274,10 @@ class _VastGPUServer(_BaseGPUServer):
                 if is_alive:
                     self._absent_polls   = 0
                     self._instance_alive = True
+                    if info:
+                        dph      = float(info.get("dph_total", self._cost_per_hour))
+                        uptime   = float(info.get("uptime_mins", 0.0))
+                        self._total_cost = dph * uptime / 60.0
                 else:
                     self._absent_polls += 1
                     if self._absent_polls >= 2:
@@ -440,12 +455,21 @@ class _VastGPUServer(_BaseGPUServer):
     def _cmd_cancel(self, conn) -> None:
         with self._lock:
             instance_id = self._instance_id
+            ssh_host    = self._ssh_host
+            ssh_port    = self._ssh_port
+            run_name    = self._run_name
         try:
-            if instance_id:
-                _sdk().destroy_instance(id=int(instance_id))
-                conn.sendall(b"ok\n")
-            else:
+            if not instance_id:
                 conn.sendall(b"error no job running\n")
+                return
+            if not (ssh_host and ssh_port):
+                conn.sendall(b"error no ssh connection to instance\n")
+                return
+            # Kill only the training process — leave the instance running
+            _ssh(ssh_host, ssh_port,
+                 f"pkill -f 'train.py.*--run-name {run_name}'",
+                 timeout=15)
+            conn.sendall(b"ok\n")
         except Exception as e:
             conn.sendall(f"error {e}\n".encode())
         finally:
@@ -570,7 +594,7 @@ class VastBackend(_BaseBackend):
                 if "--run-name" in parts:
                     run_name = parts[parts.index("--run-name") + 1]
             except Exception:
-                training_found = True  # SSH failed; assume alive
+                continue  # SSH failed during discovery — skip and retry next cycle
 
             if not training_found:
                 continue  # instance alive but no training process — skip

@@ -87,22 +87,36 @@ class QueueModal(ModalScreen):
 
 
 class AddStepModal(ModalScreen):
-    """Add a step to an existing queued experiment."""
+    """Add or edit a step in a queued experiment."""
     BINDINGS = [
-        Binding("ctrl+s", "confirm", "Add Step"),
+        Binding("ctrl+s", "confirm", "Save"),
         Binding("escape", "dismiss", "Cancel"),
     ]
 
+    def __init__(self, backend_ids: list[str], initial_params: dict | None = None,
+                 initial_gpu_pref: str = "any", title: str = "Add Step to Experiment"):
+        super().__init__()
+        self._initial         = initial_params or {}
+        self._title           = title
+        self._backend_ids     = backend_ids
+        self._initial_gpu_pref = initial_gpu_pref
+
     def compose(self):
+        defaults    = _load_defaults()
+        gpu_options = [("any", "any")] + [(b, b) for b in self._backend_ids]
         yield Footer()
         with Vertical(id="spawn-dialog"):
-            yield Label("Add Step to Experiment", id="spawn-title")
+            yield Label(self._title, id="spawn-title")
+            yield Label("gpu")
+            yield Select(gpu_options, value=self._initial_gpu_pref,
+                         allow_blank=False, id="gpu-pref")
             with VerticalScroll(id="spawn-params"):
-                for key, val in _load_defaults().items():
+                for key, val in defaults.items():
+                    current = self._initial.get(key, val)
                     yield Label(key)
-                    yield Input(value=str(val), id=f"param-{key}")
+                    yield Input(value=str(current), id=f"param-{key}")
             with Horizontal(id="spawn-buttons"):
-                yield Button("Add Step", variant="success", id="step-confirm")
+                yield Button("Save", variant="success", id="step-confirm")
                 yield Button("Cancel", variant="error", id="step-cancel")
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -112,7 +126,9 @@ class AddStepModal(ModalScreen):
             self.action_confirm()
 
     def action_confirm(self) -> None:
-        self.dismiss(_collect_params(self))
+        params = _collect_params(self)
+        params["gpu_preference"] = str(self.query_one("#gpu-pref", Select).value)
+        self.dismiss(params)
 
 
 class EditExperimentModal(ModalScreen):
@@ -179,6 +195,13 @@ class ExperimentsMixin:
         self._checkpoints(), self.notify(), self.push_screen(), self.query_one()
     """
 
+    def _exp_runs(self, base_run_name: str) -> list:
+        """All TrainingRuns belonging to an experiment, matched by chain_experiment
+        (multi-step) or run_name (single-step)."""
+        return [r for r in self.runs
+                if r.chain_experiment == base_run_name
+                or (r.chain_experiment is None and r.run_name == base_run_name)]
+
     def _save_queue(self) -> None:
         with open(QUEUE_FILE, "w") as f:
             json.dump(self.experiment_queue, f, indent=2)
@@ -207,13 +230,20 @@ class ExperimentsMixin:
             return
         candidates = self._checkpoints(run.run_name)
         checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
-        gpu = self._gpu_by_index(run.gpu_id) or self._free_gpu()
+        # Per-step GPU preference overrides experiment-level preference
+        pref = tasks[next_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
+        used = {r.gpu_id for r in self.runs if r.status == "running" and r.gpu_id is not None}
+        if pref == "any":
+            gpu = self._free_gpu()
+        else:
+            gpu = next((g for g in self._gpus if g.backend_id == pref and g.index not in used), None)
         if gpu is None:
             self.notify(f"No GPU available for chain step {next_idx + 1}", severity="error")
             return
+        actual_run_name = f"{run.chain_experiment}_{next_idx + 1}"
         launch_config = {
             **tasks[next_idx],
-            "run_name":   run.run_name,
+            "run_name":   actual_run_name,
             "gpu_id":     gpu.index,
             "checkpoint": checkpoint,
         }
@@ -224,7 +254,7 @@ class ExperimentsMixin:
         new_run.chain_task_idx    = next_idx
         new_run.chain_total_tasks = run.chain_total_tasks
         self.notify(
-            f"{run.run_name}: step {next_idx + 1}/{run.chain_total_tasks} started",
+            f"{actual_run_name}: step {next_idx + 1}/{run.chain_total_tasks} started",
             timeout=5,
         )
 
@@ -239,14 +269,12 @@ class ExperimentsMixin:
             tasks = exp.get("tasks") or [exp]
             run_name = exp.get("run_name", "-")
 
+            exp_runs = self._exp_runs(run_name)
             done_run = next(
-                (r for r in self.runs
-                 if r.run_name == run_name and r.status in ("stopped", "killed", "error")),
-                None,
+                (r for r in exp_runs if r.status in ("stopped", "killed", "error")), None,
             )
             running_run = next(
-                (r for r in self.runs if r.run_name == run_name and r.status == "running"),
-                None,
+                (r for r in exp_runs if r.status == "running"), None,
             )
             completed_up_to = done_run.chain_task_idx if done_run is not None else -1
             running_idx = running_run.chain_task_idx if running_run is not None else None
@@ -258,14 +286,16 @@ class ExperimentsMixin:
                     return " ▶"
                 return ""
 
+            def _gpu_label(task: dict, exp: dict) -> str:
+                pref = task.get("gpu_preference") or exp.get("gpu_preference", "any")
+                return "" if pref == "any" else pref
+
             task1 = tasks[0]
             changed = ", ".join(
                 f"{k}={task1[k]}" for k in defaults
                 if k in task1 and task1[k] != defaults[k]
             )
-            gpu_pref = exp.get("gpu_preference", "any")
-            gpu_label = "" if gpu_pref == "any" else gpu_pref
-            table.add_row(run_name + step_mark(0), gpu_label, changed or "(defaults)")
+            table.add_row(run_name + step_mark(0), _gpu_label(task1, exp), changed or "(defaults)")
             self._queue_row_map.append(exp_idx)
             self._queue_task_map.append(0)
 
@@ -278,7 +308,8 @@ class ExperimentsMixin:
                 is_last = step_i == len(tasks)
                 prefix = "  └─" if is_last else "  ├─"
                 task_idx = step_i - 1
-                table.add_row(f"{prefix} step {step_i}{step_mark(task_idx)}", "", changed_t or "(defaults)")
+                table.add_row(f"{prefix} step {step_i}{step_mark(task_idx)}",
+                              _gpu_label(task, exp), changed_t or "(defaults)")
                 self._queue_row_map.append(exp_idx)
                 self._queue_task_map.append(task_idx)
 
@@ -323,7 +354,12 @@ class ExperimentsMixin:
             self.notify("No experiment selected.", severity="warning")
             return
         self.selected_queue_idx = idx
-        self.push_screen(AddStepModal(), self._on_add_step_result)
+        exp         = self.experiment_queue[idx]
+        default_gpu = exp.get("gpu_preference", "any")
+        self.push_screen(
+            AddStepModal(self._backend_ids(), initial_gpu_pref=default_gpu),
+            self._on_add_step_result,
+        )
 
     def _on_add_step_result(self, params: dict | None) -> None:
         if params is None:
@@ -343,19 +379,58 @@ class ExperimentsMixin:
             self.notify("No experiment selected.", severity="warning")
             return
         self.selected_queue_idx = idx
-        exp = self.experiment_queue[self.selected_queue_idx]
-        # Block editing if experiment is currently running or has already run
+        exp      = self.experiment_queue[idx]
         run_name = exp.get("run_name")
-        if any(r.run_name == run_name for r in self.runs):
-            self.notify("Cannot edit — experiment has already started.", severity="warning")
+        tasks    = exp.get("tasks") or [exp]
+
+        table    = self.query_one("#queue-table", DataTable)
+        task_map = getattr(self, "_queue_task_map", [])
+        cursor   = table.cursor_row
+        task_idx = task_map[cursor] if task_map and 0 <= cursor < len(task_map) else 0
+
+        # A step is submitted if any run for this experiment has reached or passed it
+        submitted_up_to = -1
+        existing = next(iter(self._exp_runs(run_name)), None)
+        if existing is not None:
+            submitted_up_to = existing.chain_task_idx
+
+        if task_idx <= submitted_up_to:
+            self.notify(
+                f"Step {task_idx + 1} has already been submitted — cannot edit.",
+                severity="warning",
+            )
             return
+
+        if task_idx == 0:
+            # Edit experiment metadata + first step
+            current_params   = {k: v for k, v in tasks[0].items() if k in _load_defaults()}
+            current_gpu_pref = exp.get("gpu_preference", "any")
+            self.push_screen(
+                EditExperimentModal(run_name, current_params, self._backend_ids(), current_gpu_pref),
+                self._on_edit_experiment_result,
+            )
+        else:
+            # Edit an individual step
+            current_params   = {k: v for k, v in tasks[task_idx].items() if k in _load_defaults()}
+            current_gpu_pref = tasks[task_idx].get("gpu_preference", "any")
+            self._editing_task_idx = task_idx
+            self.push_screen(
+                AddStepModal(self._backend_ids(), initial_params=current_params,
+                             initial_gpu_pref=current_gpu_pref,
+                             title=f"Edit Step {task_idx + 1}: {run_name}"),
+                self._on_edit_step_result,
+            )
+
+    def _on_edit_step_result(self, params: dict | None) -> None:
+        if params is None:
+            return
+        exp   = self.experiment_queue[self.selected_queue_idx]
         tasks = exp.get("tasks") or [exp]
-        current_params  = {k: v for k, v in tasks[0].items() if k in _load_defaults()}
-        current_gpu_pref = exp.get("gpu_preference", "any")
-        self.push_screen(
-            EditExperimentModal(run_name, current_params, self._backend_ids(), current_gpu_pref),
-            self._on_edit_experiment_result,
-        )
+        tasks[self._editing_task_idx] = params
+        exp["tasks"] = tasks
+        self._save_queue()
+        self._refresh_queue_table()
+        self.notify(f"Updated step {self._editing_task_idx + 1} of {exp['run_name']}", timeout=3)
 
     def _on_edit_experiment_result(self, result: dict | None) -> None:
         if result is None:
@@ -385,7 +460,7 @@ class ExperimentsMixin:
 
         if task_idx == 0:
             # Removing the whole experiment — block if running or already ran
-            if any(r.run_name == run_name for r in self.runs):
+            if self._exp_runs(run_name):
                 self.notify(f"{run_name} has already started — cannot remove.", severity="warning")
                 return
             self.experiment_queue.pop(self.selected_queue_idx)
@@ -395,7 +470,7 @@ class ExperimentsMixin:
             self.notify(f"Removed experiment {run_name}", timeout=3)
         else:
             # Removing a specific step — block if that step has already run or is running
-            existing = next((r for r in self.runs if r.run_name == run_name), None)
+            existing = next(iter(self._exp_runs(run_name)), None)
             if existing is not None and existing.chain_task_idx >= task_idx:
                 self.notify(f"Step {task_idx + 1} has already run — cannot remove.", severity="warning")
                 return
@@ -425,15 +500,34 @@ class ExperimentsMixin:
             self.notify("Select the experiment row (not a step) to submit the chain.", severity="warning")
             return
         self.selected_queue_idx = idx
-        exp = self.experiment_queue[idx]
+        exp      = self.experiment_queue[idx]
         run_name = exp["run_name"]
+        tasks    = exp.get("tasks") or [exp]
+        multi    = len(tasks) > 1
 
         # Block if a run is already active for this experiment
-        if any(r.run_name == run_name and r.status == "running" for r in self.runs):
+        if any(r.status == "running" for r in self._exp_runs(run_name)):
             self.notify(f"{run_name} is already running.", severity="warning")
             return
 
-        pref = exp.get("gpu_preference", "any")
+        # Find the next step to run by looking at any stopped run for this experiment
+        start_task_idx = 0
+        checkpoint     = None
+        existing = next(
+            (r for r in self._exp_runs(run_name) if r.status in ("stopped", "killed", "error")),
+            None,
+        )
+        if existing is not None:
+            start_task_idx = existing.chain_task_idx + 1
+            if start_task_idx >= len(tasks):
+                self.notify(f"{run_name}: all {len(tasks)} steps already completed.", severity="warning")
+                return
+            candidates = self._checkpoints(existing.run_name)
+            checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
+            self.runs.remove(existing)
+
+        # Per-step GPU preference overrides experiment-level preference
+        pref = tasks[start_task_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
         used = {r.gpu_id for r in self.runs if r.status == "running" and r.gpu_id is not None}
         if pref == "any":
             gpu = self._free_gpu()
@@ -443,35 +537,17 @@ class ExperimentsMixin:
             self.notify(f"No free GPU available{f' on {pref}' if pref != 'any' else ''}.", severity="error")
             return
 
-        tasks = exp.get("tasks") or [exp]
-
-        # Find the next step to run by looking at any stopped run for this experiment
-        start_task_idx = 0
-        checkpoint = None
-        existing = next(
-            (r for r in self.runs
-             if r.run_name == run_name and r.status in ("stopped", "killed", "error")),
-            None,
-        )
-        if existing is not None:
-            # chain_task_idx tracks the last step that ran; advance past it
-            start_task_idx = existing.chain_task_idx + 1
-            if start_task_idx >= len(tasks):
-                self.notify(f"{run_name}: all {len(tasks)} steps already completed.", severity="warning")
-                return
-            candidates = self._checkpoints(run_name)
-            checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
-            self.runs.remove(existing)
-
-        launch_config = {**tasks[start_task_idx], "run_name": run_name, "gpu_id": gpu.index}
+        # Multi-step experiments get a _N suffix on the run name
+        actual_run_name = f"{run_name}_{start_task_idx + 1}" if multi else run_name
+        launch_config = {**tasks[start_task_idx], "run_name": actual_run_name, "gpu_id": gpu.index}
         if checkpoint:
             launch_config["checkpoint"] = checkpoint
         self._on_spawn_result(launch_config)
-        if len(tasks) > 1:
+        if multi:
             new_run = self.runs[-1]
             new_run.chain_experiment  = run_name
             new_run.chain_task_idx    = start_task_idx
             new_run.chain_total_tasks = len(tasks)
             self._save_state()
-        step_label = f" (step {start_task_idx + 1}/{len(tasks)})" if len(tasks) > 1 else ""
-        self.notify(f"Submitted {run_name}{step_label} on GPU {gpu.index}", timeout=5)
+        step_label = f" (step {start_task_idx + 1}/{len(tasks)})" if multi else ""
+        self.notify(f"Submitted {actual_run_name}{step_label} on GPU {gpu.index}", timeout=5)

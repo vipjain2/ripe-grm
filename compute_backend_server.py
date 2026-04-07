@@ -49,6 +49,11 @@ class _BaseGPUServer(ABC):
 
     _POLL_INTERVAL: int = 0  # 0 = no background polling; backends set non-zero
 
+    def _discover_extra(self) -> dict:
+        """Extra fields to include in the discover response for this GPU.
+        Override in backends to expose cost_per_hour, instance_id, etc."""
+        return {}
+
     def start(self) -> None:
         t = threading.Thread(target=self._serve, daemon=True,
                              name=f"gpu-server-{self._index}")
@@ -300,6 +305,7 @@ class _BackendServer:
                 "cost_per_hour": 0.0,
                 "sock_path":     s.sock_path,
                 "backend_id":    self._backend_id,
+                **s._discover_extra(),
             }
             for s in sorted(self._servers.values(), key=lambda s: s._index)
         ]
