@@ -38,7 +38,7 @@ from pathlib import Path
 from vastai import VastAI
 
 from ripe_autotrain.compute_backend_client import SocketJobHandle
-from ripe_autotrain.compute_backend_server import _BaseBackend, _BackendServer, _BaseGPUServer
+from ripe_autotrain.compute_backend_server import _BackendServer, _BaseGPUServer
 
 DEFAULT_VAST_SOCK = "/tmp/drl_vast_backend.sock"
 _REGISTRY_PATH   = Path.cwd() / "compute_registry.json"
@@ -445,7 +445,6 @@ class _VastGPUServer(_BaseGPUServer):
                 self._log_offset     = 0
                 self._log_complete   = False
 
-            self._backend._save_state()
             conn.sendall(f"ok {instance_id}\n".encode())
         except Exception as e:
             conn.sendall(f"error {e}\n".encode())
@@ -503,7 +502,7 @@ class _VastGPUServer(_BaseGPUServer):
 # VastBackend
 # ---------------------------------------------------------------------------
 
-class VastBackend(_BaseBackend):
+class VastBackend:
     """Manages a pool of virtual GPU slots backed by Vast.ai instances.
     Pure server — use BackendClient from compute_backend_client.py to interact."""
 
@@ -513,24 +512,21 @@ class VastBackend(_BaseBackend):
                  image:        str        = "pytorch/pytorch:2.1.0-cuda12.1-cudnn8-runtime",
                  disk_gb:      int        = 20,
                  project_root: Path | None = None,
-                 state_file:   Path | None = None,
                  sock_path:    str        = DEFAULT_VAST_SOCK,
                  backend_id:   str        = "vast"):
         self.offer_query  = offer_query
         self.image        = image
         self.disk_gb      = disk_gb
         self.project_root = project_root or Path.cwd()
-        self._state_file  = state_file or (self.project_root / "vast_backend_state.json")
         self._servers: dict[int, _VastGPUServer] = {
             i: _VastGPUServer(i, self) for i in range(num_slots)
         }
         for server in self._servers.values():
             server.start()
         self._backend_server = _BackendServer(
-            self._servers, self._save_state, sock_path, backend_id,
+            self._servers, sock_path, backend_id,
         )
         self._backend_server.start()
-        self._restore_state()
         threading.Thread(target=self._poll_instances_loop, daemon=True,
                          name="vast-instance-poll").start()
 

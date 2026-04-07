@@ -223,10 +223,9 @@ class _BaseGPUServer(ABC):
 class _BackendServer:
     """Daemon thread exposing a single backend socket for discovery and state queries."""
 
-    def __init__(self, servers: "dict[int, _BaseGPUServer]", save_state,
+    def __init__(self, servers: "dict[int, _BaseGPUServer]",
                  sock_path: str, backend_id: str):
         self._servers    = servers
-        self._save_state = save_state
         self._sock_path  = sock_path
         self._backend_id = backend_id
         self._ready      = threading.Event()
@@ -325,7 +324,6 @@ class _BackendServer:
                     "sock_path":  s.sock_path,
                     "backend_id": self._backend_id,
                 })
-        self._save_state()
         conn.sendall((json.dumps(jobs) + "\n").encode())
         conn.close()
 
@@ -340,7 +338,6 @@ class _BackendServer:
             if handle is None:
                 conn.sendall(b"error job not alive\n")
                 return
-            self._save_state()
             conn.sendall((json.dumps({
                 "run_name":   handle.run_name,
                 "id":         handle.id,
@@ -378,48 +375,3 @@ class _BackendServer:
             conn.close()
 
 
-# ---------------------------------------------------------------------------
-# _BaseBackend
-# ---------------------------------------------------------------------------
-
-class _BaseBackend:
-    """State persistence mixin for backends.
-
-    Concrete backends must assign self._servers (dict[int, _BaseGPUServer])
-    and self._state_file (Path) before calling _restore_state().
-    """
-
-    _servers:    "dict[int, _BaseGPUServer]"
-    _state_file: Path
-
-    def _save_state(self) -> None:
-        entries = []
-        for server in self._servers.values():
-            h = server.current_handle()
-            if h is not None:
-                entries.append({
-                    "run_name": h.run_name,
-                    "id":       h.id,
-                    "gpu_id":   h.gpu_id,
-                    "log_file": h.log_file,
-                })
-        self._state_file.write_text(json.dumps(entries, indent=2))
-
-    def _restore_state(self) -> None:
-        if not self._state_file.exists():
-            return
-        try:
-            entries = json.loads(self._state_file.read_text())
-        except (json.JSONDecodeError, OSError):
-            return
-        for entry in entries:
-            server = self._servers.get(entry.get("gpu_id"))
-            if server is None:
-                continue
-            job_id = str(entry.get("id") or entry.get("pid", ""))
-            server.register_job(
-                run_name = entry["run_name"],
-                job_id   = job_id,
-                log_file = entry.get("log_file", ""),
-            )
-        self._save_state()

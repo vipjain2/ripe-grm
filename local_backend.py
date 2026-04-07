@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 
 from ripe_autotrain.compute_backend_client import SocketJobHandle
-from ripe_autotrain.compute_backend_server import _BaseBackend, _BackendServer, _BaseGPUServer
+from ripe_autotrain.compute_backend_server import _BackendServer, _BaseGPUServer
 
 DEFAULT_BACKEND_SOCK = "/tmp/drl_backend.sock"
 
@@ -127,7 +127,6 @@ class _GPUServer(_BaseGPUServer):
                 self._run_name = cfg["run_name"]
                 self._log_file = str(log_path)
 
-            self._backend._save_state()
             conn.sendall(f"ok {proc.pid}\n".encode())
         except Exception as e:
             conn.sendall(f"error {e}\n".encode())
@@ -184,22 +183,19 @@ class _GPUServer(_BaseGPUServer):
 # LocalBackend
 # ---------------------------------------------------------------------------
 
-class LocalBackend(_BaseBackend):
+class LocalBackend:
     """Starts per-GPU socket servers and the backend socket.
     Pure server — use BackendClient from compute_backend_client.py to interact."""
 
     def __init__(self, project_root: Path | None = None,
-                 state_file: Path | None = None,
                  sock_path: str = DEFAULT_BACKEND_SOCK,
                  backend_id: str = "local"):
         self.project_root = project_root or Path.cwd()
-        self._state_file  = state_file or (self.project_root / "backend_state.json")
         self._servers: dict[int, _GPUServer] = {}
         self._init_gpu_servers()
-        self._backend_server = _BackendServer(self._servers, self._save_state,
-                                              sock_path, backend_id)
+        self._backend_server = _BackendServer(self._servers, sock_path, backend_id)
         self._backend_server.start()
-        self._restore_state()
+        self._discover_running_jobs()
 
     def _init_gpu_servers(self) -> None:
         try:
@@ -218,6 +214,72 @@ class LocalBackend(_BaseBackend):
             server = _GPUServer(idx, name.strip(), self)
             server.start()
             self._servers[idx] = server
+
+    def _discover_running_jobs(self) -> None:
+        """Scan nvidia-smi for running compute processes and re-attach any train.py jobs."""
+        try:
+            uuid_out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=index,gpu_uuid",
+                 "--format=csv,noheader"],
+                text=True, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return
+        uuid_to_idx: dict[str, int] = {}
+        for line in uuid_out.strip().splitlines():
+            if not line.strip():
+                continue
+            idx_str, uuid = [x.strip() for x in line.split(",", 1)]
+            uuid_to_idx[uuid] = int(idx_str)
+
+        try:
+            apps_out = subprocess.check_output(
+                ["nvidia-smi", "--query-compute-apps=pid,gpu_uuid",
+                 "--format=csv,noheader"],
+                text=True, stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            return
+
+        for line in apps_out.strip().splitlines():
+            if not line.strip():
+                continue
+            parts = [x.strip() for x in line.split(",", 1)]
+            if len(parts) != 2:
+                continue
+            pid_str, uuid = parts
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+            gpu_idx = uuid_to_idx.get(uuid)
+            if gpu_idx is None:
+                continue
+            server = self._servers.get(gpu_idx)
+            if server is None:
+                continue
+
+            try:
+                cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+                args = cmdline.decode("utf-8", errors="replace").split("\x00")
+            except OSError:
+                continue
+
+            if not any("train.py" in a for a in args):
+                continue
+
+            run_name = None
+            log_file = ""
+            for i, arg in enumerate(args):
+                if arg == "--run-name" and i + 1 < len(args):
+                    run_name = args[i + 1]
+                elif arg == "--log-file" and i + 1 < len(args):
+                    log_file = args[i + 1]
+
+            if run_name is None:
+                continue
+
+            server.register_job(run_name=run_name, job_id=str(pid), log_file=log_file)
 
 
 # ---------------------------------------------------------------------------
