@@ -118,6 +118,7 @@ class SocketJobHandle(JobHandle):
 
     def _connect(self) -> socket.socket:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5.0)
         sock.connect(self._sock_path)
         return sock
 
@@ -191,8 +192,9 @@ class _GPUClient(GPU):
         self.name       = f"GPU({backend_id}, {index})"
         self._sock_path = sock_path
 
-    def _request(self, cmd: str) -> str:
+    def _request(self, cmd: str, timeout: float = 15.0) -> str:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
         sock.connect(self._sock_path)
         sock.sendall((cmd + "\n").encode())
         buf = b""
@@ -206,6 +208,8 @@ class _GPUClient(GPU):
 
     def status(self) -> GPUStatus:
         d = json.loads(self._request("status"))
+        if "error" in d:
+            raise RuntimeError(d["error"])
         return GPUStatus(**d)
 
     def env_vars(self) -> dict[str, str]:

@@ -19,6 +19,7 @@ import json
 import os
 import socket
 import threading
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -46,11 +47,34 @@ class _BaseGPUServer(ABC):
         self._log_file: str = ""
         self._ready    = threading.Event()
 
+    _POLL_INTERVAL: int = 0  # 0 = no background polling; backends set non-zero
+
     def start(self) -> None:
         t = threading.Thread(target=self._serve, daemon=True,
                              name=f"gpu-server-{self._index}")
         t.start()
         self._ready.wait(timeout=5.0)
+        if self._POLL_INTERVAL > 0:
+            threading.Thread(target=self._poll_loop, daemon=True,
+                             name=f"gpu-poll-{self._index}").start()
+
+    def _poll_loop(self) -> None:
+        """Background poll thread: calls _poll() every _POLL_INTERVAL seconds."""
+        try:
+            self._poll()
+        except Exception:
+            pass
+        while True:
+            time.sleep(self._POLL_INTERVAL)
+            try:
+                self._poll()
+            except Exception:
+                pass
+
+    def _poll(self) -> None:
+        """Periodic background work (alive check, log fetch, status).
+        No-op by default — override in backends that need it."""
+        pass
 
     # -- Abstract interface --------------------------------------------------
 

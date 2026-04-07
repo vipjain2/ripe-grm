@@ -1,30 +1,26 @@
-"""Training dashboard — app entry point, tick loop, UI composition, and Tasks-tab actions."""
+"""Training dashboard — app entry point, tick loop, UI composition, and state management."""
 
 import json
-import os
 import re
 import subprocess
-import sys
-import threading
 import time
 from pathlib import Path
 
 from ripe_autotrain.compute_backend_client import GPU, JobConfig
 from ripe_autotrain.dashboard_backend import init_backends, live_jobs
-from ripe_autotrain.dashboard_experiments import (
-    ExperimentsMixin, _load_defaults,
-)
-from ripe_autotrain.dashboard_train_runs import TrainingRun, SpawnModal
+from ripe_autotrain.dashboard_experiments import ExperimentsMixin, _load_defaults
+from ripe_autotrain.dashboard_tasks import TasksMixin, TasksTab, LOG_DIR
+from ripe_autotrain.dashboard_train_runs import TrainingRun
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Vertical
+from textual.widget import Widget
 from textual.widgets import (
-    Button, DataTable, Footer, Header, Input, Label, Log,
+    Button, DataTable, Footer, Header,
     Static, TabbedContent, TabPane,
 )
 
-_TRAINING_DIR    = Path.cwd()
-BACKEND_REGISTRY = _TRAINING_DIR / "compute_registry.json"
+_TRAINING_DIR = Path.cwd()
 
 def _load_project_config() -> tuple[Path | None, Path | None]:
     cfg_file = _TRAINING_DIR / "dashboard_config.json"
@@ -41,13 +37,43 @@ _backends, _backend_by_id, _gpus, N_GPUS = init_backends()
 
 STATE_FILE  = _TRAINING_DIR / "runs_state.json"
 CONFIG_FILE = _TRAINING_DIR / "dashboard_config.json"
-LOG_DIR     = Path("/tmp/drl_runs")
+
+
+# ---------------------------------------------------------------------------
+# Experiments tab widget
+# ---------------------------------------------------------------------------
+class ExperimentsTab(Widget):
+    DEFAULT_CSS = "ExperimentsTab { height: 1fr; }"
+    BINDINGS = [
+        Binding("q", "app.quit",                "Quit"),
+        Binding("a", "app.add_to_queue",        "Add"),
+        Binding("r", "app.remove_from_queue",   "Remove"),
+        Binding("e", "app.edit_experiment",     "Edit"),
+        Binding("x", "app.add_step",            "Extend"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        from textual.containers import Horizontal
+        with Vertical():
+            yield DataTable(id="queue-table", cursor_type="row")
+            with Horizontal(id="queue-actions"):
+                yield Button("Submit", id="queue-submit", variant="success")
 
 
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
-class Dashboard(App, ExperimentsMixin):
+class GPUStatusTab(Widget):
+    DEFAULT_CSS = "GPUStatusTab { height: 1fr; }"
+    BINDINGS = [Binding("q", "app.quit", "Quit")]
+    can_focus = True
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="gpu-panel"):
+            yield Static("", id="gpu-status")
+
+
+class Dashboard(App, TasksMixin, ExperimentsMixin):
     TITLE = "AutoTrain"
     CSS = """
     TabbedContent { height: 1fr; }
@@ -69,6 +95,7 @@ class Dashboard(App, ExperimentsMixin):
         padding: 1 2;
     }
     #tasks-container { height: 1fr; overflow-y: auto; }
+    #spawn-params { height: 1fr; }
     #spawn-title { text-align: center; text-style: bold; margin-bottom: 1; }
     #spawn-buttons { margin-top: 1; height: auto; align: center middle; }
     """
@@ -76,19 +103,8 @@ class Dashboard(App, ExperimentsMixin):
     ENABLE_COMMAND_PALETTE = False
 
     BINDINGS = [
-        Binding("n", "spawn",        "New run"),
-        Binding("c", "continue_run", "Continue"),
-        Binding("k", "kill",         "Kill selected"),
-        Binding("d", "delete",       "Delete selected"),
-        Binding("t", "tensorboard",  "TensorBoard"),
-        Binding("r", "render",       "Render"),
-        Binding("a", "add_to_queue",      "Add experiment"),
-        Binding("x", "remove_from_queue", "Remove experiment"),
-        Binding("e", "add_step",          "Extend"),
-        Binding("s", "submit_queue",      "Submit queue"),
         Binding("ctrl+p", "command_palette", "Palette"),
-        Binding("ctrl+c", "quit",    "Quit", priority=True),
-        Binding("q", "quit",         "Quit"),
+        Binding("ctrl+c", "quit", "Quit", priority=True, show=False),
     ]
 
     def __init__(self):
@@ -99,36 +115,26 @@ class Dashboard(App, ExperimentsMixin):
         self.selected_run_name: str | None = None
         self._rebuilding_table: bool = False
         self.selected_queue_idx: int = -1
-        self._active_tab: str = "tab-experiments"
         self._tb_process: subprocess.Popen | None = None
+        self._gpus = _gpus
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with TabbedContent():
             with TabPane("Experiments", id="tab-experiments"):
-                with Vertical():
-                    yield DataTable(id="queue-table", cursor_type="row")
-                    with Horizontal(id="queue-actions"):
-                        yield Button("Submit", id="queue-submit", variant="success")
+                yield ExperimentsTab()
             with TabPane("Tasks", id="tab-tasks"):
-                with Horizontal(id="main"):
-                    with Vertical(id="left-panel"):
-                        yield Label(f" MJX Training Runs  ({N_GPUS} GPUs)", markup=False)
-                        yield DataTable(id="runs-table", cursor_type="row")
-                    with Vertical(id="right-panel"):
-                        yield Label(" Log Output", markup=False)
-                        yield Log(id="log-view", auto_scroll=False)
+                yield TasksTab(N_GPUS)
             with TabPane("GPU Status", id="tab-gpu"):
-                with Vertical(id="gpu-panel"):
-                    yield Static("", id="gpu-status")
+                yield GPUStatusTab()
         yield Footer()
 
     def on_mount(self) -> None:
         runs_table = self.query_one("#runs-table", DataTable)
-        runs_table.add_columns("Name", "Device", "ID", "Status", "Elapsed", "Steps", "Ckpt")
+        runs_table.add_columns("Name", "Device", "ID", "Status", "Elapsed")
 
         queue_table = self.query_one("#queue-table", DataTable)
-        queue_table.add_columns("Name", "Changed Params")
+        queue_table.add_columns("Name", "GPU", "Changed Params")
 
         self._load_config()
         self._load_state()
@@ -137,7 +143,7 @@ class Dashboard(App, ExperimentsMixin):
         self.set_interval(1.0, self._tick)
 
     # -----------------------------------------------------------------------
-    # State persistence
+    # Config / state persistence
     # -----------------------------------------------------------------------
     def _load_config(self) -> None:
         if CONFIG_FILE.exists():
@@ -165,18 +171,6 @@ class Dashboard(App, ExperimentsMixin):
         ]
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
-
-    def _params_for_run(self, run_name: str) -> dict:
-        """Read hyperparams from the run's latest JSON sidecar, fall back to _load_defaults()."""
-        if _OUTPUT_DIR:
-            candidates = list(_OUTPUT_DIR.glob(f"{run_name}*.json"))
-        else:
-            candidates = list(_TRAINING_DIR.rglob(f"{run_name}*.json"))
-        if candidates:
-            latest = max(candidates, key=lambda p: p.stat().st_mtime)
-            with open(latest) as f:
-                return json.load(f)
-        return dict(_load_defaults())
 
     def _attach_running_processes(self) -> None:
         """Scan each GPU for training processes not yet tracked by the backend."""
@@ -257,7 +251,7 @@ class Dashboard(App, ExperimentsMixin):
                 with open(meta_path) as f:
                     meta = json.load(f)
             stem = ckpt.stem
-            run_name = meta.get("run_name") or re.sub(r"(_\d{8}_\d{4}|_final)$", "", stem)
+            run_name = meta.get("run_name") or re.sub(r"(_\d{8}_\d{4}|_final|_latest)$", "", stem)
             if run_name in seen:
                 continue
             handle = live.get(run_name)
@@ -278,72 +272,24 @@ class Dashboard(App, ExperimentsMixin):
     # Helpers
     # -----------------------------------------------------------------------
     def _free_gpu(self) -> "GPU | None":
+        self._refresh_gpus()
         used = {r.gpu_id for r in self.runs if r.status == "running" and r.gpu_id is not None}
-        return next((g for g in _gpus if g.index not in used), None)
+        return next((g for g in self._gpus if g.index not in used), None)
 
     def _gpu_by_index(self, idx: int | None) -> "GPU | None":
         if idx is None:
             return None
-        return next((g for g in _gpus if g.index == idx), None)
-
-    def _checkpoints(self, run_name: str) -> list[Path]:
-        if _OUTPUT_DIR or _LOG_DIR:
-            candidates = list(_OUTPUT_DIR.glob(f"{run_name}*.msgpack")) if _OUTPUT_DIR else []
-            if _LOG_DIR:
-                candidates += list(_LOG_DIR.rglob(f"{run_name}*.msgpack"))
-            return candidates
-        return list(_TRAINING_DIR.rglob(f"{run_name}*.msgpack"))
+        found = next((g for g in self._gpus if g.index == idx), None)
+        if found is None:
+            self._refresh_gpus()
+            found = next((g for g in self._gpus if g.index == idx), None)
+        return found
 
     # -----------------------------------------------------------------------
-    # Tick helpers
+    # Tick
     # -----------------------------------------------------------------------
-    def _process_run(self, run: TrainingRun) -> tuple[list[str], bool]:
-        """Drain the run's log queue, parse state, detect errors/stops.
-
-        Returns (new_lines, state_dirty).
-        """
-        state_dirty = False
-        new_lines = run.drain_queue()
-        run.log_lines.extend(new_lines)
-
-        for line in new_lines:
-            m = re.search(r"steps=\s*([\d,]+)", line)
-            if m:
-                run.steps = int(m.group(1).replace(",", ""))
-                state_dirty = True
-
-        for line in new_lines:
-            if "Traceback (most recent call last)" in line or "Error:" in line:
-                if run.is_alive():
-                    run.terminate()
-                    run.status = "error"
-                    run.stopped_at = time.time()
-                    run.log_lines.append("[dashboard] Error detected — process terminated.")
-                    state_dirty = True
-
-        if run.status == "running" and not run.is_alive():
-            run.status = "stopped"
-            run.stopped_at = time.time()
-            state_dirty = True
-            if run.chain_experiment and run.chain_task_idx + 1 < run.chain_total_tasks:
-                self.call_after_refresh(lambda r=run: self._spawn_chain_task(r))
-
-        return new_lines, state_dirty
-
-    def _update_log_view(self, new_lines: list[str], log_widget: Log) -> None:
-        """Write new lines to the log widget, preserving scroll position."""
-        if not new_lines:
-            return
-        at_bottom = log_widget.scroll_y >= log_widget.virtual_size.height - log_widget.size.height - 3
-        scroll_y = log_widget.scroll_y
-        for line in new_lines:
-            log_widget.write_line(line)
-        if at_bottom:
-            log_widget.scroll_end(animate=False)
-        else:
-            log_widget.scroll_to(y=scroll_y, animate=False)
-
     def _tick(self) -> None:
+        from textual.widgets import Log
         log_widget  = self.query_one("#log-view", Log)
         state_dirty = False
         for run in self.runs:
@@ -355,15 +301,59 @@ class Dashboard(App, ExperimentsMixin):
         if state_dirty:
             self._save_state()
 
+        now = time.time()
+        if now - getattr(self, "_last_cloud_poll", 0) >= 60:
+            self._last_cloud_poll = now
+            import threading
+            threading.Thread(target=self._poll_cloud_runs, daemon=True).start()
+
         self._refresh_table()
-        self._refresh_gpu_status()
+
+    def _poll_cloud_runs(self) -> None:
+        """Detect cloud jobs tracked by the backend but not yet in self.runs."""
+        seen = {r.run_name for r in self.runs}
+        for handle in (j for b in _backends for j in b.running_jobs()):
+            if handle.run_name in seen or not handle.run_name:
+                continue
+            gpu = self._gpu_by_index(handle.gpu_id)
+            run = TrainingRun(
+                run_name = handle.run_name,
+                gpu_id   = handle.gpu_id,
+                params   = self._params_for_run(handle.run_name),
+                handle   = handle,
+                log_file = handle.log_file,
+                status   = "running",
+            )
+            if handle.log_file:
+                run.start_reader()
+            self.runs.append(run)
+            seen.add(handle.run_name)
+            self.notify(f"Detected cloud run: {handle.run_name}", timeout=5)
+
+    def _refresh_gpus(self) -> None:
+        """Discover available GPUs from all backends (on-demand, call before scheduling)."""
+        try:
+            self._gpus = [g for b in _backends for g in b.discover_gpus()]
+        except Exception:
+            pass
 
     def _refresh_gpu_status(self) -> None:
+        """Fetch GPU status in a background thread and update the GPU Status tab."""
+        import threading
+        threading.Thread(target=self._refresh_gpu_status_bg, daemon=True).start()
+
+    def _refresh_gpu_status_bg(self) -> None:
+        self._refresh_gpus()
         lines = []
-        for gpu in _gpus:
+        for gpu in self._gpus:
             try:
                 s = gpu.status()
-            except Exception:
+            except Exception as e:
+                lines.append(f"{gpu.name:<20s}  [red]{e}[/red]")
+                continue
+            if s.mem_total_mb == 0:
+                cost_str = f"  ${gpu.cost_per_hour:.2f}/hr" if gpu.cost_per_hour > 0 else ""
+                lines.append(f"{gpu.name:<20s}  [dim]idle — no instance{cost_str}[/dim]")
                 continue
             bar_filled = s.util_pct // 5
             bar        = "█" * bar_filled + "░" * (20 - bar_filled)
@@ -377,107 +367,24 @@ class Dashboard(App, ExperimentsMixin):
                 f"{cost_str}"
             )
         if lines:
-            self.query_one("#gpu-status", Static).update("\n".join(lines))
-
-    def _last_step_from_tb(self, run_name: str) -> int:
-        try:
-            from tbparse import SummaryReader
-            if _LOG_DIR:
-                log_dir = _LOG_DIR / run_name
-            else:
-                parents = [p.parent for p in _TRAINING_DIR.rglob("events.out.tfevents.*")
-                           if run_name in str(p)]
-                log_dir = parents[0] if parents else None
-            if not log_dir or not Path(log_dir).exists():
-                return 0
-            df = SummaryReader(str(log_dir)).scalars
-            return int(df["step"].max()) if not df.empty else 0
-        except Exception:
-            return 0
-
-    def _has_checkpoint(self, run: TrainingRun) -> str:
-        return "yes" if self._checkpoints(run.run_name) else "-"
-
-    def _refresh_table(self) -> None:
-        from textual.coordinate import Coordinate
-        table = self.query_one("#runs-table", DataTable)
-        sorted_runs = sorted(self.runs, key=lambda r: r.status != "running")
-        current_keys = [r.run_name for r in sorted_runs]
-        new_selected = -1
-
-        if current_keys != getattr(self, "_table_run_keys", None):
-            # Structure changed — full rebuild needed
-            scroll_x, scroll_y = table.scroll_x, table.scroll_y
-            self._rebuilding_table = True
-            table.clear()
-            for i, run in enumerate(sorted_runs):
-                total = run.steps if run.steps else run.steps_offset
-                table.add_row(
-                    run.run_name, run.device_label,
-                    (run.handle.id if run.handle else "-"),
-                    run.status, run.elapsed,
-                    f"{total:,}" if total else "-",
-                    self._has_checkpoint(run),
-                )
-                if run.run_name == self.selected_run_name:
-                    new_selected = i
-            self._table_run_keys = current_keys
-            if new_selected >= 0:
-                table.move_cursor(row=new_selected)
-            table.scroll_to(x=scroll_x, y=scroll_y, animate=False)
-            self.call_after_refresh(lambda: setattr(self, "_rebuilding_table", False))
-        else:
-            # Same rows — update only changing cells in-place (no clear, no scroll disruption)
-            for i, run in enumerate(sorted_runs):
-                total = run.steps if run.steps else run.steps_offset
-                table.update_cell_at(Coordinate(i, 3), run.status)
-                table.update_cell_at(Coordinate(i, 4), run.elapsed)
-                table.update_cell_at(Coordinate(i, 5), f"{total:,}" if total else "-")
-                if run.run_name == self.selected_run_name:
-                    new_selected = i
-            self.selected_idx = new_selected
-
-    def _show_run(self, idx: int) -> None:
-        sorted_runs = sorted(self.runs, key=lambda r: r.status != "running")
-        if idx >= len(sorted_runs):
-            return
-        run = sorted_runs[idx]
-        if run.run_name == self.selected_run_name:
-            return
-        self.selected_idx = idx
-        self.selected_run_name = run.run_name
-        log = self.query_one("#log-view", Log)
-        log.clear()
-        for line in run.log_lines[-500:]:
-            log.write_line(line)
-        log.scroll_end(animate=False)
+            self.call_from_thread(
+                self.query_one("#gpu-status", Static).update, "\n".join(lines)
+            )
 
     # -----------------------------------------------------------------------
     # Events
     # -----------------------------------------------------------------------
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
         tab_id = str(event.tab.id)
-        if tab_id.endswith("tab-tasks"):
-            self._active_tab = "tab-tasks"
-        elif tab_id.endswith("tab-experiments"):
-            self._active_tab = "tab-experiments"
+        if tab_id.endswith("tab-experiments"):
             self._load_queue()
             self._refresh_queue_table()
+            self.query_one("#queue-table", DataTable).focus()
+        elif tab_id.endswith("tab-tasks"):
+            self.query_one("#runs-table", DataTable).focus()
         elif tab_id.endswith("tab-gpu"):
-            self._active_tab = "tab-gpu"
-        self.refresh_bindings()
-
-    def check_action(self, action: str, parameters: tuple) -> bool | None:
-        tasks_only       = {"spawn", "continue_run", "kill", "delete", "tensorboard", "render"}
-        experiments_only = {"add_to_queue", "remove_from_queue", "add_step", "submit_queue"}
-        gpu_hidden       = tasks_only | experiments_only
-        if self._active_tab == "tab-gpu" and action in gpu_hidden:
-            return False
-        if action in tasks_only and self._active_tab != "tab-tasks":
-            return False
-        if action in experiments_only and self._active_tab != "tab-experiments":
-            return False
-        return True
+            self.query_one(GPUStatusTab).focus()
+            self._refresh_gpu_status()
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if self._rebuilding_table:
@@ -492,141 +399,6 @@ class Dashboard(App, ExperimentsMixin):
             self._show_run(event.cursor_row)
         elif event.data_table.id == "queue-table":
             self.selected_queue_idx = event.cursor_row
-
-    # -----------------------------------------------------------------------
-    # Actions — Tasks tab
-    # -----------------------------------------------------------------------
-    def action_spawn(self) -> None:
-        gpu = self._free_gpu()
-        self.push_screen(SpawnModal(gpu.index if gpu is not None else 0, N_GPUS), self._on_spawn_result)
-
-    def _on_spawn_result(self, config: dict | None) -> None:
-        if config is None:
-            return
-        gpu_id = config["gpu_id"]
-        gpu    = next((g for g in _gpus if g.index == gpu_id), None)
-        if gpu is None:
-            self.notify(f"GPU {gpu_id} not found.", severity="error")
-            return
-
-        ts       = time.strftime("%Y%m%d_%H%M%S")
-        log_file = LOG_DIR / f"{config['run_name']}_{ts}.log"
-
-        job_config = JobConfig(
-            run_name   = config["run_name"],
-            script     = "train.py",
-            params     = {k: v for k, v in config.items() if k in _load_defaults()},
-            checkpoint = config.get("checkpoint"),
-            log_file   = str(log_file),
-        )
-        handle = gpu.submit(job_config)
-
-        run = TrainingRun(
-            run_name = config["run_name"],
-            gpu_id   = gpu_id,
-            params   = {k: v for k, v in config.items() if k in _load_defaults()},
-            handle   = handle,
-            log_file = str(log_file),
-        )
-        run.start_reader()
-        self.runs.append(run)
-        self._save_state()
-        self._refresh_table()
-        self.selected_idx = len(self.runs) - 1
-
-    def _selected_run(self) -> "TrainingRun | None":
-        if not self.selected_run_name:
-            return None
-        return next((r for r in self.runs if r.run_name == self.selected_run_name), None)
-
-    def action_continue_run(self) -> None:
-        run = self._selected_run()
-        if run is None:
-            self.notify("No run selected.", severity="error")
-            return
-        if run.status == "running":
-            self.notify("Run is still active — kill it first.", severity="error")
-            return
-        candidates = self._checkpoints(run.run_name)
-        if not candidates:
-            self.notify(f"No checkpoint found for {run.run_name}.", severity="error")
-            return
-        checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime))
-        config = self._params_for_run(run.run_name)
-        config["run_name"]   = run.run_name
-        fallback_gpu = self._free_gpu()
-        config["gpu_id"] = run.gpu_id if run.gpu_id is not None else (fallback_gpu.index if fallback_gpu else 0)
-        config["checkpoint"] = checkpoint
-        self.runs.remove(run)
-        self._on_spawn_result(config)
-        self.runs[-1].steps_offset = self._last_step_from_tb(run.run_name)
-        self.notify(f"Continuing {run.run_name} from {Path(checkpoint).name}", timeout=5)
-
-    def action_kill(self) -> None:
-        run = self._selected_run()
-        if run is None:
-            return
-        if run.status == "running":
-            run.terminate()
-            run.status = "killed"
-            run.stopped_at = time.time()
-            run.log_lines.append("[dashboard] Process terminated.")
-            self._save_state()
-            self._refresh_table()
-            self.query_one("#log-view", Log).write_line("[dashboard] Process terminated.")
-
-    def action_delete(self) -> None:
-        run = self._selected_run()
-        if run is None:
-            return
-        if run.status == "running":
-            run.terminate()
-        self.runs.remove(run)
-        self.selected_run_name = None
-        self._save_state()
-        self._refresh_table()
-        self.query_one("#log-view", Log).clear()
-
-    def action_render(self) -> None:
-        run = self._selected_run()
-        if run is None:
-            self.notify("No run selected.", severity="error")
-            return
-        candidates = self._checkpoints(run.run_name)
-        if not candidates:
-            self.notify(f"No .msgpack found for {run.run_name}.", severity="error")
-            return
-        latest = max(candidates, key=lambda p: p.stat().st_mtime)
-        gpu = self._free_gpu() or (_gpus[0] if _gpus else None)
-        env  = os.environ.copy()
-        if gpu:
-            env.update(gpu.env_vars())
-        proc = subprocess.Popen(
-            [sys.executable, "render.py", "--model", str(latest)],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1, cwd=_TRAINING_DIR, env=env,
-        )
-
-        def _read_render(q):
-            for line in proc.stdout:
-                q.put(line.rstrip())
-            q.put(None)
-
-        threading.Thread(target=_read_render, args=(run.log_queue,), daemon=True).start()
-        self.notify(f"Rendering {run.run_name} — {latest.name}", timeout=5)
-
-    def action_tensorboard(self) -> None:
-        if self._tb_process and self._tb_process.poll() is None:
-            self._tb_process.terminate()
-            self._tb_process = None
-            self.notify("TensorBoard stopped.", severity="warning")
-        else:
-            self._tb_process = subprocess.Popen(
-                [sys.executable, "-m", "tensorboard.main", "--logdir", str(_LOG_DIR) if _LOG_DIR else "."],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                cwd=_TRAINING_DIR,
-            )
-            self.notify("TensorBoard started at http://localhost:6006", timeout=5)
 
     # -----------------------------------------------------------------------
     # Quit

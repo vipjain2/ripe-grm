@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 from ripe_autotrain.compute_backend_client import JobHandle
 from ripe_autotrain.dashboard_experiments import _load_defaults, _collect_params
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label
 
@@ -28,6 +28,7 @@ class TrainingRun:
     steps:      int = 0
     steps_offset: int = 0
     log_file:   str = ""
+    alive_failures:    int = 0
     chain_experiment:  str | None = None
     chain_task_idx:    int = 0
     chain_total_tasks: int = 1
@@ -94,9 +95,10 @@ class SpawnModal(ModalScreen):
             yield Input(placeholder=f"run_{int(time.time())}", id="run-name")
             yield Label(f"gpu_id  (0–{self._n_gpus - 1})")
             yield Input(value=default_device, id="gpu-id")
-            for key, val in _load_defaults().items():
-                yield Label(key)
-                yield Input(value=str(val), id=f"param-{key}")
+            with VerticalScroll(id="spawn-params"):
+                for key, val in _load_defaults().items():
+                    yield Label(key)
+                    yield Input(value=str(val), id=f"param-{key}")
             with Horizontal(id="spawn-buttons"):
                 yield Button("Spawn", variant="success", id="spawn-confirm")
                 yield Button("Cancel", variant="error", id="spawn-cancel")
