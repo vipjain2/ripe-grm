@@ -18,12 +18,14 @@ from __future__ import annotations
 import json
 import os
 import socket
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
 from ripe_autotrain.compute_backend_client import SocketJobHandle
+from ripe_autotrain.dashboard_log import log_debug, log_error
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +51,12 @@ class _BaseGPUServer(ABC):
 
     _POLL_INTERVAL: int = 0  # 0 = no background polling; backends set non-zero
 
+    @property
+    def python_cmd(self) -> list[str]:
+        """Command prefix to invoke Python for a training job.
+        Returns [sys.executable, "-u"] by default; cloud backends override this."""
+        return [sys.executable, "-u"]
+
     def _discover_extra(self) -> dict:
         """Extra fields to include in the discover response for this GPU.
         Override in backends to expose cost_per_hour, instance_id, etc."""
@@ -67,14 +75,14 @@ class _BaseGPUServer(ABC):
         """Background poll thread: calls _poll() every _POLL_INTERVAL seconds."""
         try:
             self._poll()
-        except Exception:
-            pass
+        except Exception as e:
+            log_error("_poll failed (startup)", exc=e, gpu_index=self._index)
         while True:
             time.sleep(self._POLL_INTERVAL)
             try:
                 self._poll()
-            except Exception:
-                pass
+            except Exception as e:
+                log_error("_poll failed", exc=e, gpu_index=self._index)
 
     def _poll(self) -> None:
         """Periodic background work (alive check, log fetch, status).
@@ -189,7 +197,9 @@ class _BaseGPUServer(ABC):
             else:
                 conn.sendall(f"error unknown: {cmd}\n".encode())
                 conn.close()
-        except Exception:
+        except Exception as e:
+            log_error("_BaseGPUServer._handle_client unhandled exception", exc=e,
+                      gpu_index=self._index)
             try:
                 conn.close()
             except Exception:
@@ -282,7 +292,8 @@ class _BackendServer:
             else:
                 conn.sendall(f"error unknown: {cmd}\n".encode())
                 conn.close()
-        except Exception:
+        except Exception as e:
+            log_error("_BackendServer._handle_client unhandled exception", exc=e)
             try:
                 conn.close()
             except Exception:

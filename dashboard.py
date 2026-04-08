@@ -9,6 +9,7 @@ from pathlib import Path
 from ripe_autotrain.compute_backend_client import GPU, JobConfig
 from ripe_autotrain.dashboard_backend import init_backends, live_jobs
 from ripe_autotrain.dashboard_experiments import ExperimentsMixin, _load_defaults
+from ripe_autotrain.dashboard_log import init as _init_log, log_error
 from ripe_autotrain.dashboard_tasks import TasksMixin, TasksTab, LOG_DIR
 from ripe_autotrain.dashboard_train_runs import TrainingRun
 from textual.app import App, ComposeResult
@@ -22,16 +23,18 @@ from textual.widgets import (
 
 _TRAINING_DIR = Path.cwd()
 
-def _load_project_config() -> tuple[Path | None, Path | None]:
+def _load_project_config() -> tuple[Path | None, Path | None, Path]:
     cfg_file = _TRAINING_DIR / "dashboard_config.json"
     if not cfg_file.exists():
-        return None, None
+        return None, None, Path("/tmp")
     cfg = json.loads(cfg_file.read_text())
-    output_dir = (_TRAINING_DIR / cfg["output_dir"]) if "output_dir" in cfg else None
-    log_dir    = (_TRAINING_DIR / cfg["log_dir"])    if "log_dir"    in cfg else None
-    return output_dir, log_dir
+    output_dir   = (_TRAINING_DIR / cfg["output_dir"])    if "output_dir"   in cfg else None
+    log_dir      = (_TRAINING_DIR / cfg["log_dir"])       if "log_dir"      in cfg else None
+    debug_log_dir = Path(cfg["debug_log_dir"])            if "debug_log_dir" in cfg else Path("/tmp")
+    return output_dir, log_dir, debug_log_dir
 
-_OUTPUT_DIR, _LOG_DIR = _load_project_config()
+_OUTPUT_DIR, _LOG_DIR, _DEBUG_LOG_DIR = _load_project_config()
+_init_log(_DEBUG_LOG_DIR)
 
 _backends, _backend_by_id, _gpus, N_GPUS = init_backends()
 
@@ -234,7 +237,9 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
             )
             self.runs.append(run)
             seen.add(run_name)
-            if handle and run.log_file and Path(run.log_file).exists():
+            if handle:
+                # Always start reader — cloud logs stream via socket regardless
+                # of whether the dashboard-side log file exists locally
                 run.start_reader()
 
     def _load_existing_runs(self) -> None:
@@ -264,7 +269,7 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
                 log_file=handle.log_file if handle else "",
             )
             self.runs.append(run)
-            if handle and run.log_file and Path(run.log_file).exists():
+            if handle:
                 run.start_reader()
             seen.add(run_name)
 
@@ -359,8 +364,11 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
             total_cost  = getattr(gpu, "total_cost", 0.0)
             id_str      = f"  ID: {instance_id}" if instance_id else ""
             if s.mem_total_mb == 0:
-                cost_str = f"  ${gpu.cost_per_hour:.2f}/hr" if gpu.cost_per_hour > 0 else ""
-                return f"{gpu.name:<20s}  [dim]idle — no instance{cost_str}{id_str}[/dim]"
+                if instance_id:
+                    cost_str  = f"  ${gpu.cost_per_hour:.4f}/hr" if gpu.cost_per_hour > 0 else ""
+                    total_str = f"  total: ${total_cost:.4f}" if total_cost > 0 else ""
+                    return f"{gpu.name:<20s}  [green]instance running[/green]{cost_str}{total_str}{id_str}"
+                return f"{gpu.name:<20s}  [dim]idle — no instance[/dim]"
             bar_filled = s.util_pct // 5
             bar        = "█" * bar_filled + "░" * (20 - bar_filled)
             temp_color = "red" if s.temp_c >= 80 else "yellow" if s.temp_c >= 70 else "green"

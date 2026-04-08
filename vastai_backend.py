@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+from ripe_autotrain.dashboard_log import log_debug, log_error
 import signal
 import subprocess
 import sys
@@ -81,7 +82,8 @@ def _show_instances() -> list[dict]:
     try:
         result = _parse_response(_sdk().show_instances())
         return result if isinstance(result, list) else []
-    except Exception:
+    except Exception as e:
+        log_error("show_instances SDK call failed", exc=e)
         return []
 
 
@@ -92,17 +94,91 @@ def _get_instance(instance_id: str) -> dict | None:
         if isinstance(result, dict) and result.get("id"):
             return result
         return None
-    except Exception:
+    except Exception as e:
+        log_error("get_instance SDK call failed", exc=e, instance_id=instance_id)
         return None
 
 
-def _execute(instance_id: str, cmd: str, timeout: int = 30) -> str:
-    """Run a command on a Vast.ai instance via SDK. Returns stdout string."""
-    result = _sdk().execute(int(instance_id), cmd)
-    if isinstance(result, str):
-        return result.strip()
-    parsed = _parse_response(result)
-    return str(parsed).strip() if parsed else ""
+def _instance_total_cost(instance_id: str) -> float:
+    """Return total billed cost for an instance by summing its invoice line items."""
+    try:
+        items = _parse_response(_sdk().show_invoices())
+        if not isinstance(items, list):
+            return 0.0
+        iid = int(instance_id)
+        return sum(float(i.get("amount", 0)) for i in items
+                   if i.get("instance_id") == iid)
+    except Exception as e:
+        log_error("instance_total_cost failed", exc=e, instance_id=instance_id)
+        return 0.0
+
+
+def _sdk_execute(instance_id: str, cmd: str) -> None:
+    """Fire-and-forget command via SDK (no output). Use for launch/cancel only."""
+    _sdk().execute(id=int(instance_id), COMMAND=cmd)
+
+
+# ---------------------------------------------------------------------------
+# InstanceSSH — SSH wrapper for monitoring commands that need output
+# ---------------------------------------------------------------------------
+
+_SSH_OPTS = [
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "LogLevel=ERROR",
+    "-o", "ConnectTimeout=10",
+]
+
+
+class InstanceSSH:
+    """SSH connection to a single Vast.ai instance.
+
+    Used for monitoring commands that need stdout: pgrep, tail, nvidia-smi, ps.
+    Launch and cancel use _sdk_execute() (fire-and-forget).
+    File transfer uses _sdk().copy().
+    """
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+
+    def run(self, cmd: str, timeout: int = 30) -> str:
+        """Run a command and return stdout. Raises RuntimeError on non-zero exit."""
+        result = subprocess.run(
+            ["ssh", f"-p{self.port}", *_SSH_OPTS, f"root@{self.host}", cmd],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip())
+        return result.stdout.strip()
+
+    def copy_to(self, local_path: str, remote_path: str, timeout: int = 60) -> None:
+        """Copy a local file to the instance via SCP."""
+        result = subprocess.run(
+            ["scp", f"-P{self.port}", *_SSH_OPTS, local_path,
+             f"root@{self.host}:{remote_path}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip())
+
+    def wait_ready(self, timeout: int = 120) -> None:
+        """Block until SSH accepts connections."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                self.run("echo ok", timeout=10)
+                return
+            except Exception:
+                time.sleep(5)
+        raise TimeoutError(f"SSH {self.host}:{self.port} not ready within {timeout}s")
+
+    @classmethod
+    def from_instance(cls, info: dict) -> "InstanceSSH":
+        """Build from a Vast.ai instance info dict."""
+        host = info.get("ssh_host") or info.get("public_ipaddr")
+        port = int(info.get("ssh_port") or 22)
+        return cls(host, port)
 
 
 def _wait_for_running(instance_id: str, timeout: int = 300) -> dict:
@@ -147,17 +223,25 @@ class _VastGPUServer(_BaseGPUServer):
     _POLL_INTERVAL    = 10   # seconds between poll iterations
     _STATUS_MIN_SECS  = 30   # minimum seconds between nvidia-smi calls
 
+    @property
+    def python_cmd(self) -> list[str]:
+        return ["uv", "run", "--project", "/app", "python", "-u"]
+
     def __init__(self, slot_id: int, backend: "VastBackend"):
         super().__init__(slot_id, f"Vast Slot {slot_id}", f"/tmp/drl_vast_{slot_id}.sock")
         self._backend:        "VastBackend"  = backend
         self._instance_id:   str | None      = None
+        self._ssh:           InstanceSSH | None = None
         self._remote_log:    str | None      = None
         self._cost_per_hour: float           = 0.0
         self._total_cost:    float           = 0.0
         self._instance_alive: bool           = False
         self._absent_polls:  int             = 0
-        self._training_alive: bool           = False  # training process running on instance
-        self._absent_training: int           = 0      # consecutive polls with no training process
+        # Training state machine: "idle" | "submitted" | "running"
+        self._training_status: str           = "idle"
+        self._submitted_at:   float          = 0.0
+        self._absent_training: int           = 0  # consecutive missing pgrep hits (in "running")
+        self._ssh_fail_polls:  int           = 0  # consecutive SSH failures in pgrep check
         # Local log file — poll thread downloads SSH output here; _cmd_logs reads it
         self._local_log:     str             = f"/tmp/drl_vast_{slot_id}.log"
         self._log_offset:    int             = 0   # lines fetched from remote so far
@@ -171,20 +255,23 @@ class _VastGPUServer(_BaseGPUServer):
     # -- Job-state helpers (called with self._lock held) ---------------------
 
     def _job_alive(self) -> bool:
-        return self._instance_alive and self._training_alive
+        return self._instance_alive and self._training_status in ("submitted", "running")
 
     def _job_id(self) -> str:
         return str(self._instance_id) if self._instance_id else "-"
 
     def _on_job_ended(self) -> None:
         self._instance_id    = None
+        self._ssh            = None
         self._remote_log     = None
         self._cost_per_hour  = 0.0
         self._instance_alive  = False
-        self._training_alive  = False
+        self._training_status = "idle"
+        self._submitted_at    = 0.0
         self._absent_training = 0
+        self._ssh_fail_polls  = 0
         self._log_offset      = 0
-        self._log_complete    = True   # stop any waiting _cmd_logs
+        self._log_complete    = True
         with self._status_lock:
             self._status_cache = {"util_pct": 0, "temp_c": 0,
                                   "mem_used_mb": 0, "mem_total_mb": 0}
@@ -197,29 +284,32 @@ class _VastGPUServer(_BaseGPUServer):
         info = _get_instance(job_id)
         if not info or info.get("actual_status") != "running":
             return None
+        ssh = InstanceSSH.from_instance(info)
         # Check training process is actually running — instance alive != job alive
         training_alive = False
         try:
-            out = _execute(job_id,
-                           f"pgrep -fa 'train.py' | grep -- '--run-name {run_name}'",
-                           timeout=15)
+            out = ssh.run(f"pgrep -fa 'train.py' | grep -- '--run-name {run_name}' || true",
+                          timeout=15)
             training_alive = bool(out.strip())
         except Exception:
-            training_alive = True  # execute failed; assume alive, poll will correct
+            training_alive = True  # SSH failed; assume alive, poll will correct
         if not training_alive:
             return None
         with self._lock:
             self._instance_id    = job_id
+            self._ssh            = ssh
             self._remote_log     = log_file
             self._run_name       = run_name
             self._log_file       = self._local_log
             self._cost_per_hour  = float(info.get("dph_total", 0.0))
-            self._instance_alive = True
-            self._absent_polls   = 0
-            self._training_alive  = True
+            self._instance_alive  = True
+            self._absent_polls    = 0
+            self._training_status = "running"
+            self._submitted_at    = 0.0
             self._absent_training = 0
-            self._log_offset     = 0
-            self._log_complete   = False
+            self._ssh_fail_polls  = 0
+            self._log_offset      = 0
+            self._log_complete    = False
         return self._make_handle()
 
     # -- Discover extra fields -----------------------------------------------
@@ -257,10 +347,11 @@ class _VastGPUServer(_BaseGPUServer):
         """
         with self._lock:
             instance_id      = self._instance_id
+            ssh              = self._ssh
             remote_log       = self._remote_log
             run_name         = self._run_name or ""
             was_inst_alive   = self._instance_alive
-            was_train_alive  = self._training_alive
+            training_status  = self._training_status
 
         if not instance_id:
             return
@@ -275,9 +366,8 @@ class _VastGPUServer(_BaseGPUServer):
                     self._absent_polls   = 0
                     self._instance_alive = True
                     if info:
-                        dph      = float(info.get("dph_total", self._cost_per_hour))
-                        uptime   = float(info.get("uptime_mins", 0.0))
-                        self._total_cost = dph * uptime / 60.0
+                        self._cost_per_hour = float(info.get("dph_total", self._cost_per_hour))
+                        self._total_cost    = _instance_total_cost(instance_id)
                 else:
                     self._absent_polls += 1
                     if self._absent_polls >= 2:
@@ -286,86 +376,142 @@ class _VastGPUServer(_BaseGPUServer):
         if not is_alive:
             return
 
-        # 2. Training process alive check via pgrep
-        try:
-            out = _execute(instance_id,
-                           f"pgrep -fa 'train.py' | grep -- '--run-name {run_name}'",
-                           timeout=10)
-            process_found = bool(out.strip())
-        except Exception:
-            process_found = True  # execute error; keep current state, poll will retry
-
-        with self._lock:
-            if self._instance_id == instance_id:
-                if process_found:
-                    self._absent_training = 0
-                    self._training_alive  = True
+        # 2. Training process state machine — pgrep only when not idle
+        is_training_alive = False
+        if training_status in ("submitted", "running"):
+            # Check for the specifically staged run_name
+            try:
+                out = ssh.run(
+                    f"pgrep -fa 'train.py' | grep -E -- '--run-name {run_name}( |$)' || true",
+                    timeout=10)
+                process_found: bool | None = bool(out.strip())
+                with self._lock:
+                    if self._instance_id == instance_id:
+                        self._ssh_fail_polls = 0
+            except Exception as e:
+                with self._lock:
+                    if self._instance_id == instance_id:
+                        self._ssh_fail_polls += 1
+                        ssh_fails = self._ssh_fail_polls
+                if ssh_fails >= 5:
+                    # 5 consecutive SSH failures (~50s) — treat as process not found
+                    log_error("SSH pgrep failed 5x in a row; assuming training ended",
+                              instance_id=instance_id, run_name=run_name, error=str(e))
+                    process_found = False
                 else:
-                    self._absent_training += 1
-                    if self._absent_training >= 2:
-                        self._training_alive = False
+                    log_debug("pgrep SSH check failed; retaining current state",
+                              instance_id=instance_id, run_name=run_name,
+                              fail_count=ssh_fails, error=str(e))
+                    process_found = None  # unknown — keep current state
 
-        is_training_alive = process_found or self._absent_training < 2
+            # If staged run not found, do a broad scan for any train.py process
+            detected_name: str | None = None
+            if process_found is False:
+                try:
+                    broad_out = ssh.run(
+                        "ps -eo args | grep 'train.py' | grep -v grep | head -1",
+                        timeout=10)
+                    if broad_out.strip():
+                        parts = broad_out.strip().split()
+                        if "--run-name" in parts:
+                            detected_name = parts[parts.index("--run-name") + 1]
+                except Exception as e:
+                    log_debug("Broad process scan failed", instance_id=instance_id,
+                              error=str(e))
+
+            with self._lock:
+                if self._instance_id == instance_id:
+                    if process_found:
+                        self._training_status = "running"
+                        self._absent_training = 0
+                    elif detected_name:
+                        # A different training process is running — switch tracking to it
+                        log_debug("Switching tracked run to detected process",
+                                  was=run_name, now=detected_name, instance_id=instance_id)
+                        Path(self._local_log).unlink(missing_ok=True)
+                        self._run_name        = detected_name
+                        self._log_file        = self._local_log
+                        self._remote_log      = ""   # log discovery will find the real path
+                        self._training_status = "running"
+                        self._absent_training = 0
+                        self._log_offset      = 0
+                        self._log_complete    = False
+                    elif process_found is False:
+                        # No training process at all — apply timeout/absent logic
+                        if training_status == "submitted":
+                            if time.time() - self._submitted_at > 60.0:
+                                log_error("Training process never confirmed within 60s",
+                                          instance_id=instance_id, run_name=run_name)
+                                self._training_status = "idle"
+                                self._run_name        = None
+                                self._log_file        = ""
+                        else:  # "running"
+                            self._absent_training += 1
+                            if self._absent_training >= 2:
+                                self._training_status = "idle"
+                    is_training_alive = self._training_status in ("submitted", "running")
 
         # 3. Discover remote log path when not yet known
         if not remote_log and run_name:
             try:
-                found = _execute(instance_id,
-                                 f"ls -t /root/project/logs/{run_name}*.log 2>/dev/null | head -1",
-                                 timeout=10).strip()
+                found = ssh.run(
+                    f"ls -t /root/project/logs/{run_name}*.log 2>/dev/null | head -1",
+                    timeout=10).strip()
                 remote_log = found or "/var/log/onstart.log"
                 with self._lock:
                     if self._instance_id == instance_id:
                         self._remote_log = remote_log
-            except Exception:
-                pass
+            except Exception as e:
+                log_debug("remote log discovery failed", instance_id=instance_id,
+                          run_name=run_name, error=str(e))
 
         if not remote_log:
             return
 
         # 4. Fetch new log lines while training is alive
         if is_training_alive:
-            self._fetch_log_lines(instance_id, remote_log)
+            self._fetch_log_lines(ssh, remote_log)
 
         # 5. Final download when training just confirmed ended; signal log complete
+        was_train_alive     = training_status in ("submitted", "running")
         training_just_ended = was_train_alive and not is_training_alive
         if training_just_ended:
-            self._fetch_log_lines(instance_id, remote_log, final=True)
+            self._fetch_log_lines(ssh, remote_log, final=True)
             self._log_complete = True
 
         # 6. Instance died: final download + log complete
         inst_just_died = was_inst_alive and not is_alive and self._absent_polls >= 2
         if inst_just_died and not self._log_complete:
-            self._fetch_log_lines(instance_id, remote_log, final=True)
+            self._fetch_log_lines(ssh, remote_log, final=True)
             self._log_complete = True
 
         # 7. nvidia-smi — only when instance alive and enough time has passed
         if time.time() - self._last_status_t >= self._STATUS_MIN_SECS:
-            self._refresh_status_cache(instance_id)
+            self._refresh_status_cache(ssh)
             self._last_status_t = time.time()
 
-    def _fetch_log_lines(self, instance_id: str, remote_log: str,
+    def _fetch_log_lines(self, ssh: InstanceSSH, remote_log: str,
                          final: bool = False) -> None:
-        """Fetch log lines since _log_offset via execute; append to local log file."""
+        """Fetch log lines since _log_offset via SSH; append to local log file."""
         timeout = 30 if final else 10
         try:
-            out = _execute(instance_id,
-                           f"tail -n +{self._log_offset + 1} {remote_log} 2>/dev/null",
-                           timeout=timeout)
+            out = ssh.run(
+                f"tail -n +{self._log_offset + 1} {remote_log} 2>/dev/null",
+                timeout=timeout)
             if out:
                 new_lines = out.splitlines()
                 with open(self._local_log, "a") as f:
                     for line in new_lines:
                         f.write(line + "\n")
                 self._log_offset += len(new_lines)
-        except Exception:
-            pass
+        except Exception as e:
+            log_debug("fetch_log_lines failed", remote_log=remote_log,
+                      offset=self._log_offset, final=final, error=str(e))
 
-    def _refresh_status_cache(self, instance_id: str) -> None:
-        """Fetch nvidia-smi from the instance and update the cached status."""
+    def _refresh_status_cache(self, ssh: InstanceSSH) -> None:
+        """Fetch nvidia-smi via SSH and update the cached status."""
         try:
-            out = _execute(
-                instance_id,
+            out = ssh.run(
                 "nvidia-smi --query-gpu=utilization.gpu,temperature.gpu,"
                 "memory.used,memory.total --format=csv,noheader,nounits",
                 timeout=12,
@@ -378,8 +524,9 @@ class _VastGPUServer(_BaseGPUServer):
                     "mem_used_mb": int(mem_used),
                     "mem_total_mb": int(mem_total),
                 }
-        except Exception:
-            pass
+        except Exception as e:
+            log_debug("nvidia-smi SSH fetch failed", instance_id=self._instance_id,
+                      error=str(e))
 
     # -- Hardware-specific commands -----------------------------------------
 
@@ -406,44 +553,71 @@ class _VastGPUServer(_BaseGPUServer):
 
             with self._lock:
                 instance_id = self._instance_id
+                ssh         = self._ssh
 
             if not instance_id:
                 raise RuntimeError("No instance attached to this slot — attach one first.")
+            if not ssh:
+                raise RuntimeError("No SSH connection to instance.")
 
-            # 1. Copy training files to /root/project/ via SDK
+            # 0. Reject if a training job for this run_name is already tracked
+            with self._lock:
+                already_tracked = (self._training_status in ("submitted", "running")
+                                   and self._run_name == run_name)
+            if already_tracked:
+                raise RuntimeError(
+                    f"A training job for '{run_name}' is already running on this instance. "
+                    "Kill it first."
+                )
+            try:
+                existing = ssh.run(
+                    f"pgrep -fa 'train.py' | grep -E -- '--run-name {run_name}( |$)' || true",
+                    timeout=10)
+                if existing.strip():
+                    pid = existing.strip().split()[0]
+                    raise RuntimeError(
+                        f"Instance already has a running '{run_name}' process (PID {pid}). "
+                        "Kill it first."
+                    )
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(f"Could not check for existing processes: {e}")
+
+            # 1. Stage server state before launch so a timeout leaves clean state
+            Path(self._local_log).unlink(missing_ok=True)
+            with self._lock:
+                self._remote_log      = remote_log
+                self._run_name        = run_name
+                self._log_file        = self._local_log
+                self._training_status = "submitted"
+                self._submitted_at    = time.time()
+                self._absent_training = 0
+                self._log_offset      = 0
+                self._log_complete    = False
+
+            # 2. Copy training files to /root/project/ via SCP
+            ssh.run("mkdir -p /root/project/logs", timeout=10)
             project_root = self._backend.project_root
             for fname in ("train.py", "policy.py", "default_params.json"):
                 src = project_root / fname
                 if src.exists():
-                    _sdk().copy(str(src), f"{instance_id}:/root/project/{fname}")
+                    ssh.copy_to(str(src), f"/root/project/{fname}")
 
-            # 2. Build training command and launch in the background via SDK execute
-            cmd = (
-                f"cd /root/project"
-                f" && mkdir -p logs"
-                f" && nohup {sys.executable} -u {script}"
-                f" --run-name {run_name}"
-            )
+            # 3. Build training command and launch via SSH (nohup + background)
+            python_prefix = " ".join(self.python_cmd)
+            cmd = f"cd /root/project && nohup {python_prefix} {script} --run-name {run_name}"
             for key, val in params.items():
                 cmd += f" --{key.replace('_', '-')} {val}"
             if chk:
                 cmd += f" --checkpoint {chk}"
-            cmd += f" > {remote_log} 2>&1 &"
-            _execute(instance_id, cmd)
-
-            # 3. Update server state (poll thread will start fetching logs/status)
-            Path(self._local_log).unlink(missing_ok=True)  # fresh file for new job
-            with self._lock:
-                self._remote_log     = remote_log
-                self._run_name       = run_name
-                self._log_file       = self._local_log
-                self._training_alive  = True
-                self._absent_training = 0
-                self._log_offset     = 0
-                self._log_complete   = False
-
+            cmd += f" > {remote_log} 2>&1 </dev/null &"
+            # Fire-and-forget via SDK (non-blocking — no stdout returned)
+            _sdk_execute(instance_id, cmd)
+            # Poll thread will confirm the process started and transition to "running"
             conn.sendall(f"ok {instance_id}\n".encode())
         except Exception as e:
+            log_error("_cmd_submit failed", exc=e)
             conn.sendall(f"error {e}\n".encode())
         finally:
             conn.close()
@@ -457,11 +631,11 @@ class _VastGPUServer(_BaseGPUServer):
                 conn.sendall(b"error no job running\n")
                 return
             # Kill only the training process — leave the instance running
-            _execute(instance_id,
-                     f"pkill -f 'train.py.*--run-name {run_name}'",
-                     timeout=15)
+            _sdk_execute(instance_id, f"pkill -f 'train.py.*--run-name {run_name}'")
             conn.sendall(b"ok\n")
         except Exception as e:
+            log_error("_cmd_cancel failed", exc=e, instance_id=instance_id,
+                      run_name=run_name)
             conn.sendall(f"error {e}\n".encode())
         finally:
             conn.close()
@@ -527,14 +701,14 @@ class VastBackend:
         and attach any untracked ones to idle slots."""
         try:
             self._attach_untracked_instances()
-        except Exception:
-            pass
+        except Exception as e:
+            log_error("_attach_untracked_instances failed (startup)", exc=e)
         while True:
             time.sleep(30)
             try:
                 self._attach_untracked_instances()
-            except Exception:
-                pass
+            except Exception as e:
+                log_error("_attach_untracked_instances failed", exc=e)
 
     def _attach_untracked_instances(self) -> None:
         """Discover running Vast.ai instances not yet tracked and attach them to
@@ -543,7 +717,7 @@ class VastBackend:
         instances = _show_instances()
         running = [
             i for i in instances
-            if i.get("actual_status") == "running" and i.get("ssh_port")
+            if i.get("actual_status") == "running"
         ]
 
         tracked = set()
@@ -567,33 +741,36 @@ class VastBackend:
                 idle.start()
                 self._servers[slot_id] = idle
 
-            # Discover run name from the running training process
+            # Build SSH connection and discover running training process (if any)
             instance_id_str = str(info["id"])
+            ssh = InstanceSSH.from_instance(info)
             run_name = info.get("label") or f"instance-{instance_id_str}"
             training_found = False
             try:
-                ps_out = _execute(instance_id_str,
-                                  "ps -eo args | grep 'train.py' | grep -v grep | head -1",
-                                  timeout=10)
+                ps_out = ssh.run(
+                    "ps -eo args | grep 'train.py' | grep -v grep | head -1",
+                    timeout=10)
                 parts = ps_out.split()
                 training_found = bool(parts)
                 if "--run-name" in parts:
                     run_name = parts[parts.index("--run-name") + 1]
-            except Exception:
-                continue  # execute failed during discovery — skip and retry next cycle
+            except Exception as e:
+                log_debug("SSH process discovery failed during attach",
+                          instance_id=instance_id_str, error=str(e))
 
-            if not training_found:
-                continue  # instance alive but no training process — skip
-
+            total_cost = _instance_total_cost(instance_id_str)
             with idle._lock:
                 idle._instance_id     = instance_id_str
+                idle._ssh             = ssh
                 idle._cost_per_hour   = float(info.get("dph_total", 0.0))
-                idle._run_name        = run_name
-                idle._log_file        = idle._local_log
-                idle._remote_log      = ""   # poll thread will discover remote path
+                idle._total_cost      = total_cost
+                idle._run_name        = run_name if training_found else None
+                idle._log_file        = idle._local_log if training_found else ""
+                idle._remote_log      = "" if training_found else None
                 idle._instance_alive  = True
                 idle._absent_polls    = 0
-                idle._training_alive  = True
+                idle._training_status = "running" if training_found else "idle"
+                idle._submitted_at    = 0.0
                 idle._absent_training = 0
                 idle._log_offset      = 0
                 idle._log_complete    = False

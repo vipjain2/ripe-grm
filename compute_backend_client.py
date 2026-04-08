@@ -137,7 +137,9 @@ class SocketJobHandle(JobHandle):
     def is_running(self) -> bool:
         try:
             resp = self._request("job_status")
-            return json.loads(resp).get("running", False)
+            data = json.loads(resp)
+            # Verify the backend is still tracking this specific run
+            return bool(data.get("running") and data.get("run_name") == self.run_name)
         except Exception:
             return False
 
@@ -228,15 +230,16 @@ class _GPUClient(GPU):
             "checkpoint": config.checkpoint,
             "log_file":   config.log_file,
         })
-        resp = self._request(f"submit {payload}")
+        resp = self._request(f"submit {payload}", timeout=120.0)
         if not resp.startswith("ok "):
             raise RuntimeError(f"submit failed: {resp}")
         return SocketJobHandle(
-            run_name  = config.run_name,
-            gpu_id    = self.index,
-            log_file  = config.log_file,
-            id        = resp[3:],
-            sock_path = self._sock_path,
+            run_name   = config.run_name,
+            gpu_id     = self.index,
+            log_file   = config.log_file,
+            id         = resp[3:],
+            sock_path  = self._sock_path,
+            backend_id = self.backend_id,
         )
 
 

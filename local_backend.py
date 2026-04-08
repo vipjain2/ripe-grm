@@ -20,6 +20,7 @@ from pathlib import Path
 
 from ripe_autotrain.compute_backend_client import SocketJobHandle
 from ripe_autotrain.compute_backend_server import _BackendServer, _BaseGPUServer
+from ripe_autotrain.dashboard_log import log_debug, log_error
 
 DEFAULT_BACKEND_SOCK = "/tmp/drl_backend.sock"
 
@@ -93,6 +94,7 @@ class _GPUServer(_BaseGPUServer):
                 "mem_total_mb": int(mem_total),
             }) + "\n").encode())
         except Exception as e:
+            log_error("_cmd_status nvidia-smi failed", exc=e, gpu_index=self._index)
             conn.sendall((json.dumps({"error": str(e)}) + "\n").encode())
         finally:
             conn.close()
@@ -103,7 +105,7 @@ class _GPUServer(_BaseGPUServer):
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(self._index)
 
-            cmd = [sys.executable, "-u", cfg["script"],
+            cmd = [*self.python_cmd, cfg["script"],
                    "--run-name", cfg["run_name"]]
             for key, val in cfg.get("params", {}).items():
                 cmd += [f"--{key.replace('_', '-')}", str(val)]
@@ -129,6 +131,7 @@ class _GPUServer(_BaseGPUServer):
 
             conn.sendall(f"ok {proc.pid}\n".encode())
         except Exception as e:
+            log_error("_cmd_submit failed", exc=e, gpu_index=self._index)
             conn.sendall(f"error {e}\n".encode())
         finally:
             conn.close()
@@ -147,6 +150,7 @@ class _GPUServer(_BaseGPUServer):
             else:
                 conn.sendall(b"error no job running\n")
         except (OSError, ProcessLookupError) as e:
+            log_error("_cmd_cancel failed", exc=e, gpu_index=self._index, pid=pid)
             conn.sendall(f"error {e}\n".encode())
         finally:
             conn.close()
@@ -173,8 +177,9 @@ class _GPUServer(_BaseGPUServer):
                             if not self._job_alive():
                                 break
                         time.sleep(0.05)
-        except Exception:
-            pass
+        except Exception as e:
+            log_debug("_cmd_logs stream ended with error", error=str(e),
+                      log_file=log_file)
         finally:
             conn.close()
 

@@ -4,6 +4,7 @@ import json
 import time
 from pathlib import Path
 
+from ripe_autotrain.dashboard_log import log_error
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Footer, Input, Label, Select
@@ -216,7 +217,8 @@ class ExperimentsMixin:
         try:
             self._spawn_chain_task_inner(run)
         except Exception as exc:
-            self.notify(f"Chain step failed: {exc}", severity="error", timeout=10)
+            log_error("Chain step failed", exc=exc)
+            self.notify(f"Chain step failed: {exc}", severity="error", timeout=10, markup=False)
 
     def _spawn_chain_task_inner(self, run) -> None:
         next_idx = run.chain_task_idx + 1
@@ -233,18 +235,26 @@ class ExperimentsMixin:
         # Per-step GPU preference overrides experiment-level preference
         pref = tasks[next_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
         used = {r.gpu_id for r in self.runs if r.status == "running" and r.gpu_id is not None}
+        def _gpu_ready(g) -> bool:
+            if g.index in used:
+                return False
+            if g.backend_id != "local" and getattr(g, "instance_id", None) is None:
+                return False
+            return True
+
         if pref == "any":
-            gpu = self._free_gpu()
+            gpu = next((g for g in self._gpus if _gpu_ready(g)), None)
         else:
-            gpu = next((g for g in self._gpus if g.backend_id == pref and g.index not in used), None)
+            gpu = next((g for g in self._gpus if g.backend_id == pref and _gpu_ready(g)), None)
         if gpu is None:
-            self.notify(f"No GPU available for chain step {next_idx + 1}", severity="error")
+            self.notify(f"No ready GPU available for chain step {next_idx + 1}", severity="error")
             return
         actual_run_name = f"{run.chain_experiment}_{next_idx + 1}"
         launch_config = {
             **tasks[next_idx],
             "run_name":   actual_run_name,
             "gpu_id":     gpu.index,
+            "backend_id": gpu.backend_id,
             "checkpoint": checkpoint,
         }
         self.runs.remove(run)
@@ -489,6 +499,7 @@ class ExperimentsMixin:
             self._submit_selected()
 
     def _submit_selected(self) -> None:
+        self._refresh_gpus()
         idx = self._exp_idx_from_cursor()
         if idx is None:
             self.notify("No experiment selected.", severity="warning")
@@ -518,7 +529,12 @@ class ExperimentsMixin:
             None,
         )
         if existing is not None:
-            start_task_idx = existing.chain_task_idx + 1
+            # Only advance to the next step if the previous one completed cleanly.
+            # If it errored or was killed, retry that same step.
+            if existing.status == "stopped":
+                start_task_idx = existing.chain_task_idx + 1
+            else:
+                start_task_idx = existing.chain_task_idx
             if start_task_idx >= len(tasks):
                 self.notify(f"{run_name}: all {len(tasks)} steps already completed.", severity="warning")
                 return
@@ -529,17 +545,30 @@ class ExperimentsMixin:
         # Per-step GPU preference overrides experiment-level preference
         pref = tasks[start_task_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
         used = {r.gpu_id for r in self.runs if r.status == "running" and r.gpu_id is not None}
+        def _gpu_ready(g) -> bool:
+            """True if the GPU slot is free and ready to accept a job."""
+            if g.index in used:
+                return False
+            instance_id = getattr(g, "instance_id", None)
+            # For cloud backends: slot must have an instance attached
+            if g.backend_id != "local" and instance_id is None:
+                return False
+            return True
+
         if pref == "any":
-            gpu = self._free_gpu()
+            gpu = next((g for g in self._gpus if _gpu_ready(g)), None)
         else:
-            gpu = next((g for g in self._gpus if g.backend_id == pref and g.index not in used), None)
+            gpu = next((g for g in self._gpus if g.backend_id == pref and _gpu_ready(g)), None)
         if gpu is None:
-            self.notify(f"No free GPU available{f' on {pref}' if pref != 'any' else ''}.", severity="error")
+            log_error("No ready GPU available", preference=pref,
+                      gpus=[f"{g.backend_id}:{g.index}" for g in self._gpus])
+            self.notify(f"No ready GPU available{f' on {pref}' if pref != 'any' else ''}.", severity="error")
             return
 
         # Multi-step experiments get a _N suffix on the run name
         actual_run_name = f"{run_name}_{start_task_idx + 1}" if multi else run_name
-        launch_config = {**tasks[start_task_idx], "run_name": actual_run_name, "gpu_id": gpu.index}
+        launch_config = {**tasks[start_task_idx], "run_name": actual_run_name,
+                         "gpu_id": gpu.index, "backend_id": gpu.backend_id}
         if checkpoint:
             launch_config["checkpoint"] = checkpoint
         self._on_spawn_result(launch_config)

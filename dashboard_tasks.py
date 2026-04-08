@@ -11,6 +11,7 @@ from pathlib import Path
 
 from ripe_autotrain.compute_backend_client import JobConfig
 from ripe_autotrain.dashboard_experiments import _load_defaults
+from ripe_autotrain.dashboard_log import log_error
 from ripe_autotrain.dashboard_train_runs import TrainingRun, SpawnModal
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -137,10 +138,14 @@ class TasksMixin:
             for line in new_lines:
                 if "Traceback (most recent call last)" in line:
                     if run.is_alive():
-                        run.terminate()
+                        # Process still running — Traceback may be from historical log
+                        # content (e.g. a previous failed attempt). Don't act yet.
+                        break
+                    log_error("Traceback detected in log; process not alive",
+                              run_name=run.run_name, gpu_id=run.gpu_id)
                     run.status = "error"
                     run.stopped_at = time.time()
-                    run.log_lines.append("[dashboard] Error detected — process terminated.")
+                    run.log_lines.append("[dashboard] Error detected.")
                     state_dirty = True
                     break
 
@@ -230,8 +235,13 @@ class TasksMixin:
     def _on_spawn_result(self, config: dict | None) -> None:
         if config is None:
             return
-        gpu_id = config["gpu_id"]
-        gpu    = next((g for g in self._gpus if g.index == gpu_id), None)
+        gpu_id     = config["gpu_id"]
+        backend_id = config.get("backend_id")
+        if backend_id:
+            gpu = next((g for g in self._gpus
+                        if g.index == gpu_id and g.backend_id == backend_id), None)
+        else:
+            gpu = next((g for g in self._gpus if g.index == gpu_id), None)
         if gpu is None:
             self.notify(f"GPU {gpu_id} not found.", severity="error")
             return
@@ -246,7 +256,13 @@ class TasksMixin:
             checkpoint = config.get("checkpoint"),
             log_file   = str(log_file),
         )
-        handle = gpu.submit(job_config)
+        try:
+            handle = gpu.submit(job_config)
+        except Exception as e:
+            log_error("gpu.submit failed", exc=e, run_name=config["run_name"],
+                      gpu_id=gpu_id, backend_id=getattr(gpu, "backend_id", "?"))
+            self.notify(f"Submit failed: {e}", severity="error", markup=False)
+            return
 
         run = TrainingRun(
             run_name = config["run_name"],

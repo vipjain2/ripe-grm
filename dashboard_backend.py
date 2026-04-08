@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from ripe_autotrain.compute_backend_client import BackendClient, GPU
+from ripe_autotrain.dashboard_log import log_debug, log_error
 
 _TRAINING_DIR    = Path.cwd()
 BACKEND_REGISTRY = _TRAINING_DIR / "compute_registry.json"
@@ -24,7 +25,8 @@ def _backend_responsive(sock_path: str) -> bool:
     try:
         BackendClient(sock_path).info()
         return True
-    except Exception:
+    except Exception as e:
+        log_debug("backend not responsive", sock_path=sock_path, error=str(e))
         return False
 
 
@@ -45,8 +47,8 @@ def _kill_existing_backend(script: str) -> None:
                 pass
         if pids:
             time.sleep(0.5)   # give processes a moment to exit
-    except Exception:
-        pass
+    except Exception as e:
+        log_error("_kill_existing_backend failed", exc=e, script=script)
 
 
 def _start_backend_servers() -> None:
