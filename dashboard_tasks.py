@@ -256,6 +256,7 @@ class TasksMixin:
             checkpoint = config.get("checkpoint"),
             log_file   = str(log_file),
         )
+        self.notify(f"Syncing files to {gpu.name}…", timeout=4)
         try:
             handle = gpu.submit(job_config)
         except Exception as e:

@@ -62,6 +62,47 @@ class _BaseGPUServer(ABC):
         Override in backends to expose cost_per_hour, instance_id, etc."""
         return {}
 
+    # -- Checkpoint selection helpers (shared across cloud backends) ----------
+
+    def _latest_timestamped(self, msgpack_files: list[str]) -> str | None:
+        """Return the newest timestamped .msgpack path, or None if there are none."""
+        stamped = sorted(f for f in msgpack_files if "_latest." not in f)
+        return stamped[-1] if stamped else None
+
+    def _latest_rolling(self, msgpack_files: list[str]) -> str | None:
+        """Return the _latest.msgpack path, or None if absent."""
+        return next((f for f in msgpack_files if "_latest." in f), None)
+
+    def _get_mtime(self, path: str) -> int:
+        """Return mtime (epoch seconds) for a remote/local checkpoint file.
+        Subclasses must override this for their storage backend."""
+        raise NotImplementedError
+
+    def _pick_checkpoint_stem(self, msgpack_files: list[str]) -> str | None:
+        """Decide which checkpoint to download and return its stem.
+
+        Rules:
+        - If a timestamped checkpoint is newer than (or equal to) _latest,
+          training completed normally — use the timestamped one.
+        - If _latest is newer than all timestamped files, or no timestamped
+          files exist, training ended early — use _latest.
+        """
+        stamped = self._latest_timestamped(msgpack_files)
+        rolling = self._latest_rolling(msgpack_files)
+        if not stamped and not rolling:
+            return None
+        if not stamped:
+            return Path(rolling).stem
+        if not rolling:
+            return Path(stamped).stem
+        # Both exist — compare mtimes
+        try:
+            if self._get_mtime(rolling) > self._get_mtime(stamped):
+                return Path(rolling).stem  # _latest is newer — training didn't finish
+        except Exception:
+            pass  # mtime fetch failed — fall through to timestamped
+        return Path(stamped).stem
+
     def start(self) -> None:
         t = threading.Thread(target=self._serve, daemon=True,
                              name=f"gpu-server-{self._index}")

@@ -312,6 +312,16 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
             import threading
             threading.Thread(target=self._poll_cloud_runs, daemon=True).start()
 
+        # Auto-refresh GPU Status tab every 30s while it's active
+        if now - getattr(self, "_last_gpu_refresh", 0) >= 30:
+            try:
+                tc = self.query_one(TabbedContent)
+                if tc.active == "tab-gpu":
+                    self._last_gpu_refresh = now
+                    self._refresh_gpu_status()
+            except Exception:
+                pass
+
         self._refresh_table()
 
     def _poll_cloud_runs(self) -> None:

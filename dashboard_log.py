@@ -25,7 +25,7 @@ def init(log_dir: Path | str = "/tmp") -> None:
     global _logger
     if _logger is not None:
         return
-    log_path = Path(log_dir) / f"ripe_autotrain_{os.getpid()}.log"
+    log_path = Path(log_dir) / "ripe_autotrain_msgs.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     handler = logging.FileHandler(log_path, encoding="utf-8")

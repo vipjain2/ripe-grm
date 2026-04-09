@@ -230,7 +230,7 @@ class ExperimentsMixin:
         if next_idx >= len(tasks):
             self.notify(f"Chain: no step {next_idx + 1} found for '{run.chain_experiment}'", severity="error", timeout=10)
             return
-        candidates = self._checkpoints(run.run_name)
+        candidates = [c for c in self._checkpoints(run.run_name) if "_latest" not in c.stem]
         checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
         # Per-step GPU preference overrides experiment-level preference
         pref = tasks[next_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
@@ -264,8 +264,8 @@ class ExperimentsMixin:
         new_run.chain_task_idx    = next_idx
         new_run.chain_total_tasks = run.chain_total_tasks
         self.notify(
-            f"{actual_run_name}: step {next_idx + 1}/{run.chain_total_tasks} started",
-            timeout=5,
+            f"{actual_run_name}: step {next_idx + 1}/{run.chain_total_tasks} started — waiting for task to start",
+            timeout=8,
         )
 
     def _refresh_queue_table(self) -> None:
@@ -579,4 +579,4 @@ class ExperimentsMixin:
             new_run.chain_total_tasks = len(tasks)
             self._save_state()
         step_label = f" (step {start_task_idx + 1}/{len(tasks)})" if multi else ""
-        self.notify(f"Submitted {actual_run_name}{step_label} on GPU {gpu.index}", timeout=5)
+        self.notify(f"Submitted {actual_run_name}{step_label} on GPU {gpu.index} — waiting for task to start", timeout=8)

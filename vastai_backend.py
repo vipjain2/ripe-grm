@@ -113,9 +113,18 @@ def _instance_total_cost(instance_id: str) -> float:
         return 0.0
 
 
-def _sdk_execute(instance_id: str, cmd: str) -> None:
-    """Fire-and-forget command via SDK (no output). Use for launch/cancel only."""
-    _sdk().execute(id=int(instance_id), COMMAND=cmd)
+def _ssh_execute_async(ssh: "InstanceSSH", cmd: str, instance_id: str = "") -> None:
+    """Fire-and-forget command via SSH in a background thread."""
+    def _run() -> None:
+        try:
+            out = ssh.run(cmd, timeout=30)
+            if out.strip():
+                log_debug("ssh execute output", instance_id=instance_id,
+                          cmd=cmd[:80], output=out[:500])
+        except Exception as e:
+            log_error("ssh execute failed", exc=e, instance_id=instance_id,
+                      cmd=cmd[:80])
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -133,9 +142,8 @@ _SSH_OPTS = [
 class InstanceSSH:
     """SSH connection to a single Vast.ai instance.
 
-    Used for monitoring commands that need stdout: pgrep, tail, nvidia-smi, ps.
-    Launch and cancel use _sdk_execute() (fire-and-forget).
-    File transfer uses _sdk().copy().
+    Used for all remote commands: monitoring (pgrep, tail, nvidia-smi, ps),
+    launch and cancel (_ssh_execute_async), and file transfer (copy_to/SCP).
     """
 
     def __init__(self, host: str, port: int):
@@ -157,6 +165,16 @@ class InstanceSSH:
         result = subprocess.run(
             ["scp", f"-P{self.port}", *_SSH_OPTS, local_path,
              f"root@{self.host}:{remote_path}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip())
+
+    def copy_from(self, remote_path: str, local_path: str, timeout: int = 120) -> None:
+        """Copy a file from the instance to the local machine via SCP."""
+        result = subprocess.run(
+            ["scp", f"-P{self.port}", *_SSH_OPTS,
+             f"root@{self.host}:{remote_path}", local_path],
             capture_output=True, text=True, timeout=timeout,
         )
         if result.returncode != 0:
@@ -255,7 +273,7 @@ class _VastGPUServer(_BaseGPUServer):
     # -- Job-state helpers (called with self._lock held) ---------------------
 
     def _job_alive(self) -> bool:
-        return self._instance_alive and self._training_status in ("submitted", "running")
+        return self._instance_alive and self._training_status in ("submitted", "running", "downloading")
 
     def _job_id(self) -> str:
         return str(self._instance_id) if self._instance_id else "-"
@@ -445,10 +463,10 @@ class _VastGPUServer(_BaseGPUServer):
                                 self._training_status = "idle"
                                 self._run_name        = None
                                 self._log_file        = ""
-                        else:  # "running"
+                        elif training_status == "running":
                             self._absent_training += 1
                             if self._absent_training >= 2:
-                                self._training_status = "idle"
+                                self._training_status = "downloading"
                     is_training_alive = self._training_status in ("submitted", "running")
 
         # 3. Discover remote log path when not yet known
@@ -472,18 +490,27 @@ class _VastGPUServer(_BaseGPUServer):
         if is_training_alive:
             self._fetch_log_lines(ssh, remote_log)
 
-        # 5. Final download when training just confirmed ended; signal log complete
-        was_train_alive     = training_status in ("submitted", "running")
-        training_just_ended = was_train_alive and not is_training_alive
-        if training_just_ended:
+        # 5. Download checkpoints + final log when training process ended
+        is_downloading = training_status == "downloading" or (
+            training_status in ("submitted", "running") and not is_training_alive
+        )
+        if is_downloading and not self._log_complete:
             self._fetch_log_lines(ssh, remote_log, final=True)
+            self._download_checkpoints(ssh, run_name, instance_id)
             self._log_complete = True
+            with self._lock:
+                if self._instance_id == instance_id:
+                    self._training_status = "idle"
 
         # 6. Instance died: final download + log complete
         inst_just_died = was_inst_alive and not is_alive and self._absent_polls >= 2
         if inst_just_died and not self._log_complete:
             self._fetch_log_lines(ssh, remote_log, final=True)
+            self._download_checkpoints(ssh, run_name, instance_id)
             self._log_complete = True
+            with self._lock:
+                if self._instance_id == instance_id:
+                    self._training_status = "idle"
 
         # 7. nvidia-smi — only when instance alive and enough time has passed
         if time.time() - self._last_status_t >= self._STATUS_MIN_SECS:
@@ -507,6 +534,44 @@ class _VastGPUServer(_BaseGPUServer):
         except Exception as e:
             log_debug("fetch_log_lines failed", remote_log=remote_log,
                       offset=self._log_offset, final=final, error=str(e))
+
+    def _get_mtime(self, path: str) -> int:
+        out = self._ssh.run(f"stat -c %Y {path} 2>/dev/null", timeout=10)
+        return int(out.strip())
+
+    def _download_checkpoints(self, ssh: InstanceSSH, run_name: str,
+                              instance_id: str) -> None:
+        """Download checkpoint files (.msgpack + .json) from the remote instance."""
+        if not run_name:
+            return
+        local_output = self._backend.project_root / "output"
+        local_output.mkdir(exist_ok=True)
+        try:
+            listing = ssh.run(
+                f"ls /root/project/output/{run_name}*.msgpack "
+                f"/root/project/output/{run_name}*.json 2>/dev/null || true",
+                timeout=10)
+            all_files = [f.strip() for f in listing.splitlines() if f.strip()]
+            if not all_files:
+                log_debug("no checkpoints found to download", run_name=run_name,
+                          instance_id=instance_id)
+                return
+            msgpacks = [f for f in all_files if f.endswith(".msgpack")]
+            stem = self._pick_checkpoint_stem(msgpacks)
+            if not stem:
+                log_debug("no suitable checkpoint to download", run_name=run_name,
+                          instance_id=instance_id)
+                return
+            files = [f for f in all_files if Path(f).stem == stem]
+            for remote_file in files:
+                local_file = str(local_output / Path(remote_file).name)
+                log_debug("downloading checkpoint", remote=remote_file, local=local_file)
+                ssh.copy_from(remote_file, local_file)
+            log_debug("checkpoint download complete", run_name=run_name,
+                      count=len(files), instance_id=instance_id)
+        except Exception as e:
+            log_error("checkpoint download failed", exc=e, run_name=run_name,
+                      instance_id=instance_id)
 
     def _refresh_status_cache(self, ssh: InstanceSSH) -> None:
         """Fetch nvidia-smi via SSH and update the cached status."""
@@ -604,16 +669,16 @@ class _VastGPUServer(_BaseGPUServer):
                 if src.exists():
                     ssh.copy_to(str(src), f"/root/project/{fname}")
 
-            # 3. Build training command and launch via SSH (nohup + background)
+            # 3. Build training command and launch via SSH (background + disown)
             python_prefix = " ".join(self.python_cmd)
-            cmd = f"cd /root/project && nohup {python_prefix} {script} --run-name {run_name}"
+            cmd = f"cd /root/project && {python_prefix} {script} --run-name {run_name}"
             for key, val in params.items():
                 cmd += f" --{key.replace('_', '-')} {val}"
             if chk:
                 cmd += f" --checkpoint {chk}"
-            cmd += f" > {remote_log} 2>&1 </dev/null &"
-            # Fire-and-forget via SDK (non-blocking — no stdout returned)
-            _sdk_execute(instance_id, cmd)
+            cmd += f" > {remote_log} 2>&1 </dev/null & disown"
+            # Launch via SSH in background thread — non-blocking
+            _ssh_execute_async(ssh, cmd, instance_id=instance_id)
             # Poll thread will confirm the process started and transition to "running"
             conn.sendall(f"ok {instance_id}\n".encode())
         except Exception as e:
@@ -631,7 +696,13 @@ class _VastGPUServer(_BaseGPUServer):
                 conn.sendall(b"error no job running\n")
                 return
             # Kill only the training process — leave the instance running
-            _sdk_execute(instance_id, f"pkill -f 'train.py.*--run-name {run_name}'")
+            with self._lock:
+                ssh = self._ssh
+            if ssh is None:
+                conn.sendall(b"error no SSH connection\n")
+                return
+            _ssh_execute_async(ssh, f"pkill -f 'train.py.*--run-name {run_name}' || true",
+                               instance_id=instance_id)
             conn.sendall(b"ok\n")
         except Exception as e:
             log_error("_cmd_cancel failed", exc=e, instance_id=instance_id,
@@ -689,6 +760,12 @@ class VastBackend:
         }
         for server in self._servers.values():
             server.start()
+        # Attach existing instances before accepting dashboard connections
+        try:
+            self._attach_untracked_instances()
+        except Exception as e:
+            log_error("_attach_untracked_instances failed (startup)", exc=e)
+
         self._backend_server = _BackendServer(
             self._servers, sock_path, backend_id,
         )
@@ -699,10 +776,6 @@ class VastBackend:
     def _poll_instances_loop(self) -> None:
         """Background thread: discover running Vast.ai instances every 30s
         and attach any untracked ones to idle slots."""
-        try:
-            self._attach_untracked_instances()
-        except Exception as e:
-            log_error("_attach_untracked_instances failed (startup)", exc=e)
         while True:
             time.sleep(30)
             try:
