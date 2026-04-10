@@ -372,14 +372,17 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
                 s = gpu.status()
             except Exception as e:
                 return f"{gpu.name:<20s}  [red]{e}[/red]"
-            instance_id = getattr(gpu, "instance_id", None)
-            total_cost  = getattr(gpu, "total_cost", 0.0)
-            id_str      = f"  ID: {instance_id}" if instance_id else ""
+            instance_id    = getattr(gpu, "instance_id", None)
+            instance_state = getattr(gpu, "instance_state", "none")
+            total_cost     = getattr(gpu, "total_cost", 0.0)
+            id_str         = f"  ID: {instance_id}" if instance_id else ""
             if s.mem_total_mb == 0:
-                if instance_id:
+                if instance_state == "running":
                     cost_str  = f"  ${gpu.cost_per_hour:.4f}/hr" if gpu.cost_per_hour > 0 else ""
                     total_str = f"  total: ${total_cost:.4f}" if total_cost > 0 else ""
                     return f"{gpu.name:<20s}  [green]instance running[/green]{cost_str}{total_str}{id_str}"
+                if instance_state == "offline":
+                    return f"{gpu.name:<20s}  [yellow]instance offline[/yellow]{id_str}"
                 return f"{gpu.name:<20s}  [dim]idle — no instance[/dim]"
             bar_filled = s.util_pct // 5
             bar        = "█" * bar_filled + "░" * (20 - bar_filled)

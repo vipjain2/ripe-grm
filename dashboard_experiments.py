@@ -266,7 +266,7 @@ class ExperimentsMixin:
         def _gpu_ready(g) -> bool:
             if g.index in used:
                 return False
-            if g.backend_id != "local" and getattr(g, "instance_id", None) is None:
+            if g.backend_id != "local" and getattr(g, "instance_state", "none") != "running":
                 return False
             return True
 
@@ -588,9 +588,8 @@ class ExperimentsMixin:
             """True if the GPU slot is free and ready to accept a job."""
             if g.index in used:
                 return False
-            instance_id = getattr(g, "instance_id", None)
-            # For cloud backends: slot must have an instance attached
-            if g.backend_id != "local" and instance_id is None:
+            # For cloud backends: slot must have a running instance
+            if g.backend_id != "local" and getattr(g, "instance_state", "none") != "running":
                 return False
             return True
 

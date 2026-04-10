@@ -248,13 +248,8 @@ class _VastGPUServer(_BaseGPUServer):
     def __init__(self, slot_id: int, backend: "VastBackend"):
         super().__init__(slot_id, f"Vast Slot {slot_id}", f"/tmp/drl_vast_{slot_id}.sock")
         self._backend:        "VastBackend"  = backend
-        self._instance_id:   str | None      = None
         self._ssh:           InstanceSSH | None = None
         self._remote_log:    str | None      = None
-        self._cost_per_hour: float           = 0.0
-        self._total_cost:    float           = 0.0
-        self._instance_alive: bool           = False
-        self._absent_polls:  int             = 0
         # Training state machine: "idle" | "submitted" | "running"
         self._training_status: str           = "idle"
         self._submitted_at:   float          = 0.0
@@ -273,7 +268,7 @@ class _VastGPUServer(_BaseGPUServer):
     # -- Job-state helpers (called with self._lock held) ---------------------
 
     def _job_alive(self) -> bool:
-        return self._instance_alive and self._training_status in ("submitted", "running", "downloading")
+        return self._instance_state == self.INSTANCE_RUNNING and self._training_status in ("submitted", "running", "downloading")
 
     def _job_id(self) -> str:
         return str(self._instance_id) if self._instance_id else "-"
@@ -290,11 +285,8 @@ class _VastGPUServer(_BaseGPUServer):
 
     def _on_instance_detached(self) -> None:
         """Clear all instance state — slot becomes fully idle."""
-        self._on_job_ended()
-        self._instance_id    = None
-        self._ssh            = None
-        self._cost_per_hour  = 0.0
-        self._instance_alive = False
+        super()._on_instance_detached()
+        self._ssh = None
         with self._status_lock:
             self._status_cache = {"util_pct": 0, "temp_c": 0,
                                   "mem_used_mb": 0, "mem_total_mb": 0}
@@ -319,14 +311,14 @@ class _VastGPUServer(_BaseGPUServer):
         if not training_alive:
             return None
         with self._lock:
-            self._instance_id    = job_id
-            self._ssh            = ssh
-            self._remote_log     = log_file
-            self._run_name       = run_name
-            self._log_file       = self._local_log
-            self._cost_per_hour  = float(info.get("dph_total", 0.0))
-            self._instance_alive  = True
+            self._instance_id     = job_id
+            self._instance_state  = self.INSTANCE_RUNNING
             self._absent_polls    = 0
+            self._ssh             = ssh
+            self._remote_log      = log_file
+            self._run_name        = run_name
+            self._log_file        = self._local_log
+            self._cost_per_hour   = float(info.get("dph_total", 0.0))
             self._training_status = "running"
             self._submitted_at    = 0.0
             self._absent_training = 0
@@ -337,12 +329,23 @@ class _VastGPUServer(_BaseGPUServer):
 
     # -- Discover extra fields -----------------------------------------------
 
+    def _check_instance_alive(self, instance_id: str) -> dict | None:
+        info = _get_instance(instance_id)
+        if info and info.get("actual_status") == "running":
+            return info
+        return None
+
+    def _on_heartbeat_alive(self, info: dict) -> None:
+        self._cost_per_hour = float(info.get("dph_total", self._cost_per_hour))
+        self._total_cost    = _instance_total_cost(str(info["id"]))
+
     def _discover_extra(self) -> dict:
         with self._lock:
             return {
-                "cost_per_hour": self._cost_per_hour,
-                "instance_id":   self._instance_id,
-                "total_cost":    self._total_cost,
+                "cost_per_hour":  self._cost_per_hour,
+                "instance_id":    self._instance_id,
+                "instance_state": self._instance_state,
+                "total_cost":     self._total_cost,
             }
 
     # -- Override _cmd_info to report actual cost ----------------------------
@@ -373,39 +376,24 @@ class _VastGPUServer(_BaseGPUServer):
             ssh              = self._ssh
             remote_log       = self._remote_log
             run_name         = self._run_name or ""
-            was_inst_alive   = self._instance_alive
             training_status  = self._training_status
 
         if not instance_id:
             return
 
-        # 1. Instance alive check via API
-        info     = _get_instance(instance_id)
-        is_alive = bool(info and info.get("actual_status") == "running")
-
-        inst_gone = False
-        with self._lock:
-            if self._instance_id == instance_id:
-                if is_alive:
-                    self._absent_polls   = 0
-                    self._instance_alive = True
-                    if info:
-                        self._cost_per_hour = float(info.get("dph_total", self._cost_per_hour))
-                        self._total_cost    = _instance_total_cost(instance_id)
-                else:
-                    self._absent_polls += 1
-                    inst_gone = self._absent_polls >= 2
+        # 1. Instance heartbeat
+        is_alive = self._heartbeat()
 
         if not is_alive:
-            # Instance disappeared — attempt final log/checkpoint download, then detach
-            if inst_gone and not self._log_complete:
-                try:
-                    self._fetch_log_lines(ssh, remote_log, final=True)
-                    self._download_checkpoints(ssh, run_name, instance_id)
-                except Exception:
-                    pass  # instance is gone, best-effort
-                self._log_complete = True
-            if inst_gone:
+            if self._is_instance_gone():
+                # Instance confirmed gone — best-effort final download, then detach
+                if not self._log_complete:
+                    try:
+                        self._fetch_log_lines(ssh, remote_log, final=True)
+                        self._download_checkpoints(ssh, run_name, instance_id)
+                    except Exception:
+                        pass
+                    self._log_complete = True
                 with self._lock:
                     if self._instance_id == instance_id:
                         self._on_instance_detached()
@@ -855,14 +843,14 @@ class VastBackend:
             total_cost = _instance_total_cost(instance_id_str)
             with idle._lock:
                 idle._instance_id     = instance_id_str
+                idle._instance_state  = idle.INSTANCE_RUNNING
+                idle._absent_polls    = 0
                 idle._ssh             = ssh
                 idle._cost_per_hour   = float(info.get("dph_total", 0.0))
                 idle._total_cost      = total_cost
                 idle._run_name        = run_name if training_found else None
                 idle._log_file        = idle._local_log if training_found else ""
                 idle._remote_log      = "" if training_found else None
-                idle._instance_alive  = True
-                idle._absent_polls    = 0
                 idle._training_status = "running" if training_found else "idle"
                 idle._submitted_at    = 0.0
                 idle._absent_training = 0

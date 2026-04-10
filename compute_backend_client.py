@@ -190,14 +190,15 @@ class _GPUClient(GPU):
 
     def __init__(self, index: int, name: str, sock_path: str, backend_id: str = "local",
                  cost_per_hour: float = 0.0, instance_id: str | None = None,
-                 total_cost: float = 0.0):
-        self.index         = index
-        self.backend_id    = backend_id
-        self.name          = f"GPU({backend_id}, {index})"
-        self._sock_path    = sock_path
-        self.cost_per_hour = cost_per_hour
-        self.instance_id   = instance_id
-        self.total_cost    = total_cost
+                 instance_state: str = "none", total_cost: float = 0.0):
+        self.index          = index
+        self.backend_id     = backend_id
+        self.name           = f"GPU({backend_id}, {index})"
+        self._sock_path     = sock_path
+        self.cost_per_hour  = cost_per_hour
+        self.instance_id    = instance_id
+        self.instance_state = instance_state
+        self.total_cost     = total_cost
 
     def _request(self, cmd: str, timeout: float = 15.0) -> str:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -278,6 +279,7 @@ class BackendClient:
             _GPUClient(g["index"], g["name"], g["sock_path"], g["backend_id"],
                        cost_per_hour=g.get("cost_per_hour", 0.0),
                        instance_id=g.get("instance_id"),
+                       instance_state=g.get("instance_state", "none"),
                        total_cost=g.get("total_cost", 0.0))
             for g in gpus
         ]

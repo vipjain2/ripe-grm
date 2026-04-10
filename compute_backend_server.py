@@ -40,6 +40,14 @@ class _BaseGPUServer(ABC):
     job-state helpers (register_job, _job_alive, _job_id).
     """
 
+    # Instance states
+    INSTANCE_NONE    = "none"      # no instance attached to this slot
+    INSTANCE_RUNNING = "running"   # instance alive and reachable
+    INSTANCE_OFFLINE = "offline"   # instance not responding (transient or gone)
+
+    _POLL_INTERVAL: int = 0        # 0 = no background polling; backends set non-zero
+    _ABSENT_THRESHOLD: int = 2     # consecutive failed heartbeats before detaching
+
     def __init__(self, index: int, name: str, sock_path: str):
         self._index    = index
         self.name      = name
@@ -48,8 +56,12 @@ class _BaseGPUServer(ABC):
         self._run_name: str | None = None
         self._log_file: str = ""
         self._ready    = threading.Event()
-
-    _POLL_INTERVAL: int = 0  # 0 = no background polling; backends set non-zero
+        # -- Instance state (cloud backends) ---
+        self._instance_id:    str | None = None
+        self._instance_state: str = self.INSTANCE_NONE
+        self._absent_polls:   int = 0
+        self._cost_per_hour:  float = 0.0
+        self._total_cost:     float = 0.0
 
     @property
     def python_cmd(self) -> list[str]:
@@ -61,6 +73,60 @@ class _BaseGPUServer(ABC):
         """Extra fields to include in the discover response for this GPU.
         Override in backends to expose cost_per_hour, instance_id, etc."""
         return {}
+
+    # -- Instance heartbeat (cloud backends) ----------------------------------
+
+    def _check_instance_alive(self, instance_id: str) -> dict | None:
+        """Query the cloud provider to check if the instance is alive.
+        Return instance info dict if alive, None if gone or unreachable.
+        Cloud backends must override this."""
+        return None
+
+    def _on_heartbeat_alive(self, info: dict) -> None:
+        """Called (with self._lock held) when heartbeat confirms instance alive.
+        Override to update backend-specific fields (cost, etc.) from info."""
+        pass
+
+    def _on_instance_detached(self) -> None:
+        """Clear all instance state — slot becomes fully idle.
+        Called (with self._lock held) when instance is confirmed gone.
+        Cloud backends should override to clear backend-specific state."""
+        self._on_job_ended()
+        self._instance_id    = None
+        self._instance_state = self.INSTANCE_NONE
+        self._absent_polls   = 0
+        self._cost_per_hour  = 0.0
+        self._total_cost     = 0.0
+
+    def _heartbeat(self) -> bool:
+        """Run one heartbeat check. Returns True if instance is alive.
+        Updates _instance_state and _absent_polls. Calls _on_instance_detached
+        when the instance is confirmed gone after _ABSENT_THRESHOLD polls."""
+        with self._lock:
+            instance_id = self._instance_id
+        if not instance_id:
+            return False
+
+        info = self._check_instance_alive(instance_id)
+        is_alive = info is not None
+
+        with self._lock:
+            if self._instance_id != instance_id:
+                return False  # slot was reassigned during check
+            if is_alive:
+                self._absent_polls   = 0
+                self._instance_state = self.INSTANCE_RUNNING
+                self._on_heartbeat_alive(info)
+            else:
+                self._absent_polls += 1
+                if self._absent_polls >= self._ABSENT_THRESHOLD:
+                    self._instance_state = self.INSTANCE_OFFLINE
+        return is_alive
+
+    def _is_instance_gone(self) -> bool:
+        """True if the instance has been offline long enough to detach.
+        Call after _heartbeat() returns False."""
+        return self._instance_state == self.INSTANCE_OFFLINE
 
     # -- Checkpoint selection helpers (shared across cloud backends) ----------
 
