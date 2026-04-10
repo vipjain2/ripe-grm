@@ -340,26 +340,7 @@ class _VastGPUServer(_BaseGPUServer):
         self._total_cost    = _instance_total_cost(str(info["id"]))
 
     def _discover_extra(self) -> dict:
-        with self._lock:
-            return {
-                "cost_per_hour":  self._cost_per_hour,
-                "instance_id":    self._instance_id,
-                "instance_state": self._instance_state,
-                "total_cost":     self._total_cost,
-            }
-
-    # -- Override _cmd_info to report actual cost ----------------------------
-
-    def _cmd_info(self, conn) -> None:
-        with self._lock:
-            cost = self._cost_per_hour
-        conn.sendall((json.dumps({
-            "index":         self._index,
-            "name":          self.name,
-            "cost_per_hour": cost,
-            "sock_path":     self.sock_path,
-        }) + "\n").encode())
-        conn.close()
+        return {}
 
     # -- Background poll (runs in poll thread, no blocking calls elsewhere) --
 
@@ -600,16 +581,9 @@ class _VastGPUServer(_BaseGPUServer):
 
     # -- Hardware-specific commands -----------------------------------------
 
-    def _cmd_status(self, conn) -> None:
-        """Return cached GPU stats — no blocking SSH call."""
-        try:
-            with self._status_lock:
-                payload = dict(self._status_cache)
-            conn.sendall((json.dumps(payload) + "\n").encode())
-        except Exception as e:
-            conn.sendall((json.dumps({"error": str(e)}) + "\n").encode())
-        finally:
-            conn.close()
+    def _gpu_stats(self) -> dict:
+        with self._status_lock:
+            return dict(self._status_cache)
 
     def _cmd_submit(self, conn, json_str: str) -> None:
         try:

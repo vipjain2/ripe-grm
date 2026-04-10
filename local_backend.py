@@ -76,7 +76,7 @@ class _GPUServer(_BaseGPUServer):
 
     # -- Hardware-specific commands -----------------------------------------
 
-    def _cmd_status(self, conn) -> None:
+    def _gpu_stats(self) -> dict:
         try:
             out = subprocess.check_output(
                 [
@@ -87,17 +87,15 @@ class _GPUServer(_BaseGPUServer):
                 text=True, stderr=subprocess.DEVNULL,
             )
             util, temp, mem_used, mem_total = [x.strip() for x in out.strip().split(",")]
-            conn.sendall((json.dumps({
+            return {
                 "util_pct":     int(util),
                 "temp_c":       int(temp),
                 "mem_used_mb":  int(mem_used),
                 "mem_total_mb": int(mem_total),
-            }) + "\n").encode())
+            }
         except Exception as e:
-            log_error("_cmd_status nvidia-smi failed", exc=e, gpu_index=self._index)
-            conn.sendall((json.dumps({"error": str(e)}) + "\n").encode())
-        finally:
-            conn.close()
+            log_error("_gpu_stats nvidia-smi failed", exc=e, gpu_index=self._index)
+            return {"util_pct": 0, "temp_c": 0, "mem_used_mb": 0, "mem_total_mb": 0}
 
     def _cmd_submit(self, conn, json_str: str) -> None:
         try:

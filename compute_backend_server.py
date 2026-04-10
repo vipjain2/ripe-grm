@@ -253,8 +253,27 @@ class _BaseGPUServer(ABC):
         Override to clear subclass-specific job state (e.g. _pid, _process)."""
         pass
 
-    @abstractmethod
-    def _cmd_status(self, conn: socket.socket) -> None: ...
+    def _gpu_stats(self) -> dict:
+        """Return GPU utilisation stats (util_pct, temp_c, mem_used_mb, mem_total_mb).
+        Override in backends that can report hardware stats."""
+        return {"util_pct": 0, "temp_c": 0, "mem_used_mb": 0, "mem_total_mb": 0}
+
+    def _cmd_status(self, conn: socket.socket) -> None:
+        """Return combined instance + GPU status over the socket."""
+        try:
+            with self._lock:
+                payload = {
+                    "instance_id":    self._instance_id,
+                    "instance_state": self._instance_state,
+                    "cost_per_hour":  self._cost_per_hour,
+                    "total_cost":     self._total_cost,
+                }
+            payload.update(self._gpu_stats())
+            conn.sendall((json.dumps(payload) + "\n").encode())
+        except Exception as e:
+            conn.sendall((json.dumps({"error": str(e)}) + "\n").encode())
+        finally:
+            conn.close()
 
     @abstractmethod
     def _cmd_submit(self, conn: socket.socket, json_str: str) -> None: ...
@@ -346,10 +365,9 @@ class _BaseGPUServer(ABC):
 
     def _cmd_info(self, conn: socket.socket) -> None:
         conn.sendall((json.dumps({
-            "index":         self._index,
-            "name":          self.name,
-            "cost_per_hour": 0.0,
-            "sock_path":     self.sock_path,
+            "index":     self._index,
+            "name":      self.name,
+            "sock_path": self.sock_path,
         }) + "\n").encode())
         conn.close()
 
@@ -449,11 +467,10 @@ class _BackendServer:
     def _cmd_discover(self, conn: socket.socket) -> None:
         gpus = [
             {
-                "index":         s._index,
-                "name":          s.name,
-                "cost_per_hour": 0.0,
-                "sock_path":     s.sock_path,
-                "backend_id":    self._backend_id,
+                "index":      s._index,
+                "name":       s.name,
+                "sock_path":  s.sock_path,
+                "backend_id": self._backend_id,
                 **s._discover_extra(),
             }
             for s in sorted(self._servers.values(), key=lambda s: s._index)

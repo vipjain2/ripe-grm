@@ -9,7 +9,7 @@ Usage:
     gpus   = client.discover_gpus()   # list[GPU]
 
     for gpu in gpus:
-        print(gpu.index, gpu.name, gpu.cost_per_hour, gpu.status())
+        print(gpu.index, gpu.name, gpu.status())
 
     handle = gpu.submit(JobConfig(...))
     q      = handle.open_log_reader()
@@ -31,10 +31,15 @@ from dataclasses import dataclass, field
 
 @dataclass
 class GPUStatus:
-    util_pct:     int    # 0–100
-    temp_c:       int    # Celsius
-    mem_used_mb:  int
-    mem_total_mb: int
+    util_pct:       int    # 0–100
+    temp_c:         int    # Celsius
+    mem_used_mb:    int
+    mem_total_mb:   int
+    # Instance state (cloud backends)
+    instance_id:    str | None = None
+    instance_state: str = "none"   # "none" | "running" | "offline"
+    cost_per_hour:  float = 0.0
+    total_cost:     float = 0.0
 
     @property
     def mem_free_mb(self) -> int:
@@ -87,7 +92,6 @@ class JobHandle(ABC):
 class GPU(ABC):
     index:         int
     name:          str
-    cost_per_hour: float   # USD; 0.0 for local hardware
 
     @abstractmethod
     def status(self) -> GPUStatus: ...
@@ -186,19 +190,12 @@ class SocketJobHandle(JobHandle):
 # ---------------------------------------------------------------------------
 
 class _GPUClient(GPU):
-    cost_per_hour = 0.0
 
-    def __init__(self, index: int, name: str, sock_path: str, backend_id: str = "local",
-                 cost_per_hour: float = 0.0, instance_id: str | None = None,
-                 instance_state: str = "none", total_cost: float = 0.0):
+    def __init__(self, index: int, name: str, sock_path: str, backend_id: str = "local"):
         self.index          = index
         self.backend_id     = backend_id
         self.name           = f"GPU({backend_id}, {index})"
         self._sock_path     = sock_path
-        self.cost_per_hour  = cost_per_hour
-        self.instance_id    = instance_id
-        self.instance_state = instance_state
-        self.total_cost     = total_cost
 
     def _request(self, cmd: str, timeout: float = 15.0) -> str:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -276,11 +273,7 @@ class BackendClient:
         """Query the backend socket for all available GPUs."""
         gpus = json.loads(self._request("discover"))
         return [
-            _GPUClient(g["index"], g["name"], g["sock_path"], g["backend_id"],
-                       cost_per_hour=g.get("cost_per_hour", 0.0),
-                       instance_id=g.get("instance_id"),
-                       instance_state=g.get("instance_state", "none"),
-                       total_cost=g.get("total_cost", 0.0))
+            _GPUClient(g["index"], g["name"], g["sock_path"], g["backend_id"])
             for g in gpus
         ]
 
