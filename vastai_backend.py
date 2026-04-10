@@ -279,17 +279,22 @@ class _VastGPUServer(_BaseGPUServer):
         return str(self._instance_id) if self._instance_id else "-"
 
     def _on_job_ended(self) -> None:
-        self._instance_id    = None
-        self._ssh            = None
-        self._remote_log     = None
-        self._cost_per_hour  = 0.0
-        self._instance_alive  = False
+        """Clear training state. Instance may still be alive."""
         self._training_status = "idle"
         self._submitted_at    = 0.0
         self._absent_training = 0
         self._ssh_fail_polls  = 0
         self._log_offset      = 0
         self._log_complete    = True
+        self._remote_log      = None
+
+    def _on_instance_detached(self) -> None:
+        """Clear all instance state — slot becomes fully idle."""
+        self._on_job_ended()
+        self._instance_id    = None
+        self._ssh            = None
+        self._cost_per_hour  = 0.0
+        self._instance_alive = False
         with self._status_lock:
             self._status_cache = {"util_pct": 0, "temp_c": 0,
                                   "mem_used_mb": 0, "mem_total_mb": 0}
@@ -378,6 +383,7 @@ class _VastGPUServer(_BaseGPUServer):
         info     = _get_instance(instance_id)
         is_alive = bool(info and info.get("actual_status") == "running")
 
+        inst_gone = False
         with self._lock:
             if self._instance_id == instance_id:
                 if is_alive:
@@ -388,10 +394,21 @@ class _VastGPUServer(_BaseGPUServer):
                         self._total_cost    = _instance_total_cost(instance_id)
                 else:
                     self._absent_polls += 1
-                    if self._absent_polls >= 2:
-                        self._instance_alive = False
+                    inst_gone = self._absent_polls >= 2
 
         if not is_alive:
+            # Instance disappeared — attempt final log/checkpoint download, then detach
+            if inst_gone and not self._log_complete:
+                try:
+                    self._fetch_log_lines(ssh, remote_log, final=True)
+                    self._download_checkpoints(ssh, run_name, instance_id)
+                except Exception:
+                    pass  # instance is gone, best-effort
+                self._log_complete = True
+            if inst_gone:
+                with self._lock:
+                    if self._instance_id == instance_id:
+                        self._on_instance_detached()
             return
 
         # 2. Training process state machine — pgrep only when not idle
@@ -497,22 +514,11 @@ class _VastGPUServer(_BaseGPUServer):
         if is_downloading and not self._log_complete:
             self._fetch_log_lines(ssh, remote_log, final=True)
             self._download_checkpoints(ssh, run_name, instance_id)
-            self._log_complete = True
             with self._lock:
                 if self._instance_id == instance_id:
-                    self._training_status = "idle"
+                    self._on_job_ended()
 
-        # 6. Instance died: final download + log complete
-        inst_just_died = was_inst_alive and not is_alive and self._absent_polls >= 2
-        if inst_just_died and not self._log_complete:
-            self._fetch_log_lines(ssh, remote_log, final=True)
-            self._download_checkpoints(ssh, run_name, instance_id)
-            self._log_complete = True
-            with self._lock:
-                if self._instance_id == instance_id:
-                    self._training_status = "idle"
-
-        # 7. nvidia-smi — only when instance alive and enough time has passed
+        # 6. nvidia-smi — only when instance alive and enough time has passed
         if time.time() - self._last_status_t >= self._STATUS_MIN_SECS:
             self._refresh_status_cache(ssh)
             self._last_status_t = time.time()
@@ -538,6 +544,17 @@ class _VastGPUServer(_BaseGPUServer):
     def _get_mtime(self, path: str) -> int:
         out = self._ssh.run(f"stat -c %Y {path} 2>/dev/null", timeout=10)
         return int(out.strip())
+
+    def _remote_file_exists(self, remote_path: str) -> bool:
+        out = self._ssh.run(
+            f"test -f {remote_path} && echo yes || echo no", timeout=10)
+        return out.strip() == "yes"
+
+    def _upload_file(self, local_path: str, remote_path: str) -> None:
+        self._ssh.copy_to(local_path, remote_path)
+
+    def _ensure_remote_dir(self, remote_dir: str) -> None:
+        self._ssh.run(f"mkdir -p {remote_dir}", timeout=10)
 
     def _download_checkpoints(self, ssh: InstanceSSH, run_name: str,
                               instance_id: str) -> None:
@@ -669,7 +686,11 @@ class _VastGPUServer(_BaseGPUServer):
                 if src.exists():
                     ssh.copy_to(str(src), f"/root/project/{fname}")
 
-            # 3. Build training command and launch via SSH (background + disown)
+            # 3. Ensure checkpoint is available on the instance
+            if chk:
+                chk = self._ensure_remote_checkpoint(chk)
+
+            # 4. Build training command and launch via SSH (background + disown)
             python_prefix = " ".join(self.python_cmd)
             cmd = f"cd /root/project && {python_prefix} {script} --run-name {run_name}"
             for key, val in params.items():

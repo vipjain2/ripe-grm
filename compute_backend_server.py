@@ -103,6 +103,38 @@ class _BaseGPUServer(ABC):
             pass  # mtime fetch failed — fall through to timestamped
         return Path(stamped).stem
 
+    # -- Remote file helpers (cloud backends override) -----------------------
+
+    def _remote_file_exists(self, remote_path: str) -> bool:
+        """Check if a file exists on the remote instance.
+        Cloud backends must override this."""
+        raise NotImplementedError
+
+    def _upload_file(self, local_path: str, remote_path: str) -> None:
+        """Upload a local file to the remote instance.
+        Cloud backends must override this."""
+        raise NotImplementedError
+
+    def _ensure_remote_dir(self, remote_dir: str) -> None:
+        """Create a directory on the remote instance if needed.
+        Cloud backends must override this."""
+        raise NotImplementedError
+
+    def _ensure_remote_checkpoint(self, local_checkpoint: str,
+                                  remote_dir: str = "/root/project/output"
+                                  ) -> str:
+        """Ensure a checkpoint file (and its .json companion) exists on the
+        remote instance. Returns the remote path to use for --checkpoint."""
+        chk = Path(local_checkpoint)
+        remote_path = f"{remote_dir}/{chk.name}"
+        if not self._remote_file_exists(remote_path):
+            self._ensure_remote_dir(remote_dir)
+            self._upload_file(str(chk), remote_path)
+            meta = chk.with_suffix(".json")
+            if meta.exists():
+                self._upload_file(str(meta), f"{remote_dir}/{meta.name}")
+        return remote_path
+
     def start(self) -> None:
         t = threading.Thread(target=self._serve, daemon=True,
                              name=f"gpu-server-{self._index}")

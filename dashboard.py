@@ -220,6 +220,8 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
         seen = {r.run_name for r in self.runs}
         for entry in state:
             run_name = entry["run_name"]
+            if run_name in seen:
+                continue
             handle   = live.get(run_name)
             run = TrainingRun(
                 run_name          = run_name,

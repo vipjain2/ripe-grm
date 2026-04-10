@@ -196,6 +196,34 @@ class ExperimentsMixin:
         self._checkpoints(), self.notify(), self.push_screen(), self.query_one()
     """
 
+    def _find_completed_step(self, run_name: str, tasks: list[dict]
+                              ) -> tuple[int, str | None]:
+        """Scan checkpoint files to find the last completed step of a multi-step
+        experiment. Returns (next_task_idx, checkpoint_path)."""
+        last_completed = -1
+        last_checkpoint = None
+        for step_idx in range(len(tasks)):
+            step_run_name = f"{run_name}_{step_idx + 1}"
+            candidates = [c for c in self._checkpoints(step_run_name)
+                          if "_latest" not in c.stem]
+            if not candidates:
+                break
+            # Check if the .json companion has status=complete
+            best = max(candidates, key=lambda p: p.stat().st_mtime)
+            meta_path = best.with_suffix(".json")
+            if meta_path.exists():
+                with open(meta_path) as f:
+                    meta = json.load(f)
+                if meta.get("status") == "complete":
+                    last_completed = step_idx
+                    last_checkpoint = str(best)
+                    continue
+            # No status=complete — this step didn't finish
+            break
+        if last_completed >= 0:
+            return last_completed + 1, last_checkpoint
+        return 0, None
+
     def _exp_runs(self, base_run_name: str) -> list:
         """All TrainingRuns belonging to an experiment, matched by chain_experiment
         (multi-step) or run_name (single-step)."""
@@ -258,15 +286,18 @@ class ExperimentsMixin:
             "checkpoint": checkpoint,
         }
         self.runs.remove(run)
-        self._on_spawn_result(launch_config)
-        new_run = self.runs[-1]
-        new_run.chain_experiment  = run.chain_experiment
-        new_run.chain_task_idx    = next_idx
-        new_run.chain_total_tasks = run.chain_total_tasks
-        self.notify(
-            f"{actual_run_name}: step {next_idx + 1}/{run.chain_total_tasks} started — waiting for task to start",
-            timeout=8,
-        )
+
+        def _set_chain(new_run) -> None:
+            new_run.chain_experiment  = run.chain_experiment
+            new_run.chain_task_idx    = next_idx
+            new_run.chain_total_tasks = run.chain_total_tasks
+            self._save_state()
+            self.notify(
+                f"{actual_run_name}: step {next_idx + 1}/{run.chain_total_tasks} started — waiting for task to start",
+                timeout=8,
+            )
+
+        self._on_spawn_result(launch_config, on_ready=_set_chain)
 
     def _refresh_queue_table(self) -> None:
         table = self.query_one("#queue-table", DataTable)
@@ -521,7 +552,9 @@ class ExperimentsMixin:
             self.notify(f"{run_name} is already running.", severity="warning")
             return
 
-        # Find the next step to run by looking at any stopped run for this experiment
+        # Find the next step to run.
+        # 1. Check tracked runs (may survive a restart via _restore_state)
+        # 2. Fall back to scanning checkpoint files on disk
         start_task_idx = 0
         checkpoint     = None
         existing = next(
@@ -538,9 +571,15 @@ class ExperimentsMixin:
             if start_task_idx >= len(tasks):
                 self.notify(f"{run_name}: all {len(tasks)} steps already completed.", severity="warning")
                 return
-            candidates = self._checkpoints(existing.run_name)
+            candidates = [c for c in self._checkpoints(existing.run_name) if "_latest" not in c.stem]
             checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
             self.runs.remove(existing)
+        elif multi:
+            # No tracked run — scan checkpoints to find last completed step
+            start_task_idx, checkpoint = self._find_completed_step(run_name, tasks)
+            if start_task_idx >= len(tasks):
+                self.notify(f"{run_name}: all {len(tasks)} steps already completed.", severity="warning")
+                return
 
         # Per-step GPU preference overrides experiment-level preference
         pref = tasks[start_task_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
@@ -571,12 +610,13 @@ class ExperimentsMixin:
                          "gpu_id": gpu.index, "backend_id": gpu.backend_id}
         if checkpoint:
             launch_config["checkpoint"] = checkpoint
-        self._on_spawn_result(launch_config)
-        if multi:
-            new_run = self.runs[-1]
-            new_run.chain_experiment  = run_name
-            new_run.chain_task_idx    = start_task_idx
-            new_run.chain_total_tasks = len(tasks)
-            self._save_state()
-        step_label = f" (step {start_task_idx + 1}/{len(tasks)})" if multi else ""
-        self.notify(f"Submitted {actual_run_name}{step_label} on GPU {gpu.index} — waiting for task to start", timeout=8)
+        def _on_submitted(new_run) -> None:
+            if multi:
+                new_run.chain_experiment  = run_name
+                new_run.chain_task_idx    = start_task_idx
+                new_run.chain_total_tasks = len(tasks)
+                self._save_state()
+            step_label = f" (step {start_task_idx + 1}/{len(tasks)})" if multi else ""
+            self.notify(f"Submitted {actual_run_name}{step_label} on GPU {gpu.index} — waiting for task to start", timeout=8)
+
+        self._on_spawn_result(launch_config, on_ready=_on_submitted)

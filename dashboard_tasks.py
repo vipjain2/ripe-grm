@@ -232,7 +232,9 @@ class TasksMixin:
         n_gpus = len(self._gpus)
         self.push_screen(SpawnModal(gpu.index if gpu is not None else 0, n_gpus), self._on_spawn_result)
 
-    def _on_spawn_result(self, config: dict | None) -> None:
+    def _on_spawn_result(self, config: dict | None,
+                         on_ready: "callable[[TrainingRun], None] | None" = None,
+                         ) -> None:
         if config is None:
             return
         gpu_id     = config["gpu_id"]
@@ -257,27 +259,49 @@ class TasksMixin:
             log_file   = str(log_file),
         )
         self.notify(f"Syncing files to {gpu.name}…", timeout=4)
-        try:
-            handle = gpu.submit(job_config)
-        except Exception as e:
-            log_error("gpu.submit failed", exc=e, run_name=config["run_name"],
-                      gpu_id=gpu_id, backend_id=getattr(gpu, "backend_id", "?"))
-            self.notify(f"Submit failed: {e}", severity="error", markup=False)
-            return
 
-        run = TrainingRun(
-            run_name = config["run_name"],
-            gpu_id   = gpu_id,
-            params   = {k: v for k, v in config.items() if k in _load_defaults()},
-            handle   = handle,
-            log_file = str(log_file),
-        )
-        run.start_reader()
-        self.runs.append(run)
-        self.selected_run_name = run.run_name
-        self._save_state()
-        self._refresh_table()
-        self.selected_idx = len(self.runs) - 1
+        def _do_submit() -> None:
+            try:
+                handle = gpu.submit(job_config)
+            except Exception as e:
+                log_error("gpu.submit failed", exc=e, run_name=config["run_name"],
+                          gpu_id=gpu_id, backend_id=getattr(gpu, "backend_id", "?"))
+                self.call_from_thread(
+                    self.notify, f"Submit failed: {e}",
+                    severity="error", markup=False)
+                return
+
+            def _finish() -> None:
+                # Dedup: poll thread may have already discovered this run
+                existing = next(
+                    (r for r in self.runs if r.run_name == config["run_name"]),
+                    None,
+                )
+                if existing is not None:
+                    existing.handle   = handle
+                    existing.log_file = str(log_file)
+                    existing.gpu_id   = gpu_id
+                    run = existing
+                else:
+                    run = TrainingRun(
+                        run_name = config["run_name"],
+                        gpu_id   = gpu_id,
+                        params   = {k: v for k, v in config.items() if k in _load_defaults()},
+                        handle   = handle,
+                        log_file = str(log_file),
+                    )
+                    run.start_reader()
+                    self.runs.append(run)
+                self.selected_run_name = run.run_name
+                self._save_state()
+                self._refresh_table()
+                self.selected_idx = len(self.runs) - 1
+                if on_ready:
+                    on_ready(run)
+
+            self.call_from_thread(_finish)
+
+        self.run_worker(_do_submit, thread=True)
 
     def action_continue_run(self) -> None:
         run = self._selected_run()
@@ -298,9 +322,13 @@ class TasksMixin:
         config["gpu_id"]     = run.gpu_id if run.gpu_id is not None else (fallback_gpu.index if fallback_gpu else 0)
         config["checkpoint"] = checkpoint
         self.runs.remove(run)
-        self._on_spawn_result(config)
-        self.runs[-1].steps_offset = self._last_step_from_tb(run.run_name)
-        self.notify(f"Continuing {run.run_name} from {Path(checkpoint).name}", timeout=5)
+        steps_offset = self._last_step_from_tb(run.run_name)
+
+        def _on_continued(new_run) -> None:
+            new_run.steps_offset = steps_offset
+            self.notify(f"Continuing {run.run_name} from {Path(checkpoint).name}", timeout=5)
+
+        self._on_spawn_result(config, on_ready=_on_continued)
 
     def action_kill(self) -> None:
         run = self._selected_run()
