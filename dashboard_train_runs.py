@@ -1,14 +1,10 @@
-"""TrainingRun dataclass and SpawnModal — per-run state, log streaming, and the spawn dialog."""
+"""TrainingRun dataclass — per-run state and log streaming."""
 
 import queue
 import time
 from dataclasses import dataclass, field
 
 from ripe_grm.compute_backend_client import JobHandle
-from ripe_grm.dashboard_experiments import _load_defaults, _collect_params
-from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label
 
 
 # ---------------------------------------------------------------------------
@@ -86,44 +82,3 @@ class TrainingRun:
         except queue.Empty:
             pass
         return lines
-
-
-# ---------------------------------------------------------------------------
-# SpawnModal
-# ---------------------------------------------------------------------------
-class SpawnModal(ModalScreen):
-    BINDINGS = [("escape", "dismiss", "Cancel")]
-
-    def __init__(self, next_gpu: int | None, n_gpus: int):
-        super().__init__()
-        self._next_gpu = next_gpu
-        self._n_gpus   = n_gpus
-
-    def compose(self):
-        default_device = str(self._next_gpu) if self._next_gpu is not None else "0"
-        with Vertical(id="spawn-dialog"):
-            yield Label("Spawn MJX Training Run", id="spawn-title")
-            yield Label("run_name")
-            yield Input(placeholder=f"run_{int(time.time())}", id="run-name")
-            yield Label(f"gpu_id  (0–{self._n_gpus - 1})")
-            yield Input(value=default_device, id="gpu-id")
-            with VerticalScroll(id="spawn-params"):
-                for key, val in _load_defaults().items():
-                    yield Label(key)
-                    yield Input(value=str(val), id=f"param-{key}")
-            with Horizontal(id="spawn-buttons"):
-                yield Button("Spawn", variant="success", id="spawn-confirm")
-                yield Button("Cancel", variant="error", id="spawn-cancel")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "spawn-cancel":
-            self.dismiss(None)
-            return
-        try:
-            gpu_id = max(0, min(int(self.query_one("#gpu-id", Input).value), self._n_gpus - 1))
-        except ValueError:
-            gpu_id = 0
-        result = _collect_params(self)
-        result["run_name"] = self.query_one("#run-name", Input).value or f"run_{int(time.time())}"
-        result["gpu_id"]   = gpu_id
-        self.dismiss(result)

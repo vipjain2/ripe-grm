@@ -12,7 +12,7 @@ from pathlib import Path
 from ripe_grm.compute_backend_client import JobConfig
 from ripe_grm.dashboard_experiments import _load_defaults
 from ripe_grm.dashboard_log import log_error
-from ripe_grm.dashboard_train_runs import TrainingRun, SpawnModal
+from ripe_grm.dashboard_train_runs import TrainingRun
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -41,7 +41,6 @@ class TasksTab(Widget):
     DEFAULT_CSS = "TasksTab { height: 1fr; }"
     BINDINGS = [
         Binding("q", "app.quit",         "Quit"),
-        Binding("n", "app.spawn",        "New run"),
         Binding("c", "app.continue_run", "Continue"),
         Binding("k", "app.kill",         "Kill"),
         Binding("d", "app.delete",       "Delete"),
@@ -255,11 +254,6 @@ class TasksMixin:
     # -----------------------------------------------------------------------
     # Actions
     # -----------------------------------------------------------------------
-    def action_spawn(self) -> None:
-        gpu = self._free_gpu()
-        n_gpus = len(self._gpus)
-        self.push_screen(SpawnModal(gpu.index if gpu is not None else 0, n_gpus), self._on_spawn_result)
-
     def _on_spawn_result(self, config: dict | None,
                          on_ready: "callable[[TrainingRun], None] | None" = None,
                          ) -> None:

@@ -98,7 +98,7 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
     #queue-submit { width: auto; min-width: 16; }
     #queue-submit:focus { text-style: none; }
     #queue-submit.-active { background: $success; }
-    SpawnModal { align: center middle; }
+    QueueModal, AddStepModal, EditExperimentModal { align: center middle; }
     #spawn-dialog {
         width: 52; height: 80vh;
         border: thick $primary;
