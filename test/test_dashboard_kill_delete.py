@@ -11,7 +11,7 @@ import json
 import pytest
 
 from conftest import FAKE_GPU, FakeHandle
-from ripe_autotrain.dashboard_train_runs import TrainingRun
+from ripe_grm.dashboard_train_runs import TrainingRun
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +32,7 @@ def _running_run(name="exp_run") -> TrainingRun:
 async def test_spawn_sets_selected_run_name(default_params_file):
     """Kill/delete require selected_run_name to be set.
     Regression: _on_spawn_result didn't set it, so the run was unselectable."""
-    import ripe_autotrain.dashboard as dash_mod
+    import ripe_grm.dashboard as dash_mod
 
     app = dash_mod.Dashboard()
     async with app.run_test(headless=True) as pilot:
@@ -54,7 +54,7 @@ async def test_spawn_sets_selected_run_name(default_params_file):
 @pytest.mark.asyncio
 async def test_kill_freshly_spawned_run(default_params_file):
     """After spawning a run, action_kill should terminate it."""
-    import ripe_autotrain.dashboard as dash_mod
+    import ripe_grm.dashboard as dash_mod
 
     app = dash_mod.Dashboard()
     async with app.run_test(headless=True) as pilot:
@@ -76,7 +76,7 @@ async def test_kill_freshly_spawned_run(default_params_file):
 @pytest.mark.asyncio
 async def test_delete_removes_run(default_params_file):
     """After selecting a run, action_delete should remove it from self.runs."""
-    import ripe_autotrain.dashboard as dash_mod
+    import ripe_grm.dashboard as dash_mod
 
     app = dash_mod.Dashboard()
     async with app.run_test(headless=True) as pilot:
@@ -99,7 +99,7 @@ async def test_delete_removes_run(default_params_file):
 @pytest.mark.asyncio
 async def test_kill_no_selection_notifies(default_params_file):
     """action_kill with nothing selected should notify the user."""
-    import ripe_autotrain.dashboard as dash_mod
+    import ripe_grm.dashboard as dash_mod
 
     app = dash_mod.Dashboard()
     async with app.run_test(headless=True) as pilot:
@@ -123,7 +123,7 @@ async def test_kill_no_selection_notifies(default_params_file):
 async def test_submit_uses_table_cursor_not_stale_index(default_params_file):
     """Regression: table.clear() reset selected_queue_idx to 0 via cursor events,
     so submitting always submitted the first experiment regardless of visual selection."""
-    import ripe_autotrain.dashboard as dash_mod
+    import ripe_grm.dashboard as dash_mod
 
     task_params = json.loads((default_params_file / "default_params.json").read_text())
 

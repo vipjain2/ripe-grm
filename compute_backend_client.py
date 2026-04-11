@@ -142,10 +142,20 @@ class SocketJobHandle(JobHandle):
         try:
             resp = self._request("job_status")
             data = json.loads(resp)
-            # Verify the backend is still tracking this specific run
             return bool(data.get("running") and data.get("run_name") == self.run_name)
         except Exception:
             return False
+
+    def job_status(self) -> dict | None:
+        """Query the backend for current job state.
+
+        Returns dict with 'running' (bool) and 'run_name' (str), or None on error.
+        """
+        try:
+            resp = self._request("job_status")
+            return json.loads(resp)
+        except Exception:
+            return None
 
     def cancel(self) -> None:
         try:

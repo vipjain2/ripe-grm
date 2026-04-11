@@ -4,8 +4,8 @@ import queue
 import time
 from dataclasses import dataclass, field
 
-from ripe_autotrain.compute_backend_client import JobHandle
-from ripe_autotrain.dashboard_experiments import _load_defaults, _collect_params
+from ripe_grm.compute_backend_client import JobHandle
+from ripe_grm.dashboard_experiments import _load_defaults, _collect_params
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label
@@ -54,6 +54,18 @@ class TrainingRun:
 
     def is_alive(self) -> bool:
         return self.handle.is_running() if self.handle else False
+
+    def actual_run_name(self) -> str | None:
+        """Query the backend for what run name the GPU slot is actually tracking.
+
+        Returns the backend's run_name if a job is running on the slot, else None.
+        """
+        if not self.handle or not hasattr(self.handle, "job_status"):
+            return None
+        status = self.handle.job_status()
+        if status and status.get("running"):
+            return status.get("run_name")
+        return None
 
     def terminate(self) -> None:
         if self.handle:

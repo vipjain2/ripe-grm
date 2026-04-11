@@ -3,14 +3,14 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ripe-autotrain"
+name = "ripe-grm"
 version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = ["textual"]
 
 [project.scripts]
-ripe_autotrain = "ripe_autotrain.dashboard:main"
+ripe_grm = "ripe_grm.dashboard:main"
 
 [tool.setuptools.packages.find]
 where = [".."]
-include = ["ripe_autotrain*"]
+include = ["ripe_grm*"]

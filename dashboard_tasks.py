@@ -9,10 +9,10 @@ import threading
 import time
 from pathlib import Path
 
-from ripe_autotrain.compute_backend_client import JobConfig
-from ripe_autotrain.dashboard_experiments import _load_defaults
-from ripe_autotrain.dashboard_log import log_error
-from ripe_autotrain.dashboard_train_runs import TrainingRun, SpawnModal
+from ripe_grm.compute_backend_client import JobConfig
+from ripe_grm.dashboard_experiments import _load_defaults
+from ripe_grm.dashboard_log import log_error
+from ripe_grm.dashboard_train_runs import TrainingRun, SpawnModal
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
@@ -80,18 +80,26 @@ class TasksMixin:
     # Helpers
     # -----------------------------------------------------------------------
     def _checkpoints(self, run_name: str) -> list[Path]:
+        """Find checkpoint files for a specific run name.
+
+        Uses {run_name}_*.msgpack to avoid prefix collisions
+        (e.g. 'ppo_exp8_2' matching 'ppo_exp8_20260410...').
+        """
+        def _gather(root: Path, recurse: bool = False) -> list[Path]:
+            g = root.rglob if recurse else root.glob
+            return list(g(f"{run_name}_*.msgpack")) + list(g(f"{run_name}.msgpack"))
         if _OUTPUT_DIR or _LOG_DIR:
-            candidates = list(_OUTPUT_DIR.glob(f"{run_name}*.msgpack")) if _OUTPUT_DIR else []
+            candidates = _gather(_OUTPUT_DIR) if _OUTPUT_DIR else []
             if _LOG_DIR:
-                candidates += list(_LOG_DIR.rglob(f"{run_name}*.msgpack"))
+                candidates += _gather(_LOG_DIR, recurse=True)
             return candidates
-        return list(_TRAINING_DIR.rglob(f"{run_name}*.msgpack"))
+        return _gather(_TRAINING_DIR, recurse=True)
 
     def _params_for_run(self, run_name: str) -> dict:
         if _OUTPUT_DIR:
-            candidates = list(_OUTPUT_DIR.glob(f"{run_name}*.json"))
+            candidates = list(_OUTPUT_DIR.glob(f"{run_name}_*.json")) + list(_OUTPUT_DIR.glob(f"{run_name}.json"))
         else:
-            candidates = list(_TRAINING_DIR.rglob(f"{run_name}*.json"))
+            candidates = list(_TRAINING_DIR.rglob(f"{run_name}_*.json")) + list(_TRAINING_DIR.rglob(f"{run_name}.json"))
         if candidates:
             latest = max(candidates, key=lambda p: p.stat().st_mtime)
             with open(latest) as f:
@@ -146,22 +154,42 @@ class TasksMixin:
                     run.status = "error"
                     run.stopped_at = time.time()
                     run.log_lines.append("[dashboard] Error detected.")
+                    if run.chain_experiment:
+                        self._update_disk_completed(run.chain_experiment)
                     state_dirty = True
                     break
 
         if run.status == "running":
-            run.alive_failures = 0 if run.is_alive() else run.alive_failures + 1
+            alive = run.is_alive()
+            if not alive and run.alive_failures == 0:
+                # First failure — check if the backend is tracking a different
+                # run name (e.g. a prior process the dashboard didn't know about).
+                actual = run.actual_run_name()
+                if actual and actual != run.run_name:
+                    log_error("Backend tracking different run than dashboard",
+                              dashboard=run.run_name, backend=actual,
+                              gpu_id=run.gpu_id)
+                    run.run_name = actual
+                    run.log_lines.append(
+                        f"[dashboard] GPU slot is running '{actual}', updating run name.")
+                    state_dirty = True
+                    alive = True  # re-check on next tick with corrected name
+            run.alive_failures = 0 if alive else run.alive_failures + 1
 
         if run.status == "running" and run.alive_failures >= 3:
             run.status = "stopped"
             run.stopped_at = time.time()
             state_dirty = True
+            if run.chain_experiment:
+                self._update_disk_completed(run.chain_experiment)
             if run.chain_experiment and run.chain_task_idx + 1 < run.chain_total_tasks:
                 self.notify(
                     f"{run.run_name}: step {run.chain_task_idx + 1} done, launching step {run.chain_task_idx + 2}…",
                     timeout=5,
                 )
                 self.call_after_refresh(lambda r=run: self._spawn_chain_task(r))
+            else:
+                self.notify(f"{run.run_name}: training complete", timeout=8)
 
         return new_lines, state_dirty
 

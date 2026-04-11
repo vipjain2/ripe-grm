@@ -1,11 +1,11 @@
 """Dashboard file logger.
 
-Creates ripe_autotrain_<PID>.log in the configured log directory (default /tmp).
+Creates ripe_grm_<PID>.log in the configured log directory (default /tmp).
 Import `log_error` and `log_debug` anywhere in the dashboard to write timestamped
 entries with caller context.
 
 Usage:
-    from ripe_autotrain.dashboard_log import log_error, log_debug
+    from ripe_grm.dashboard_log import log_error, log_debug
     log_error("Submit failed", exc=e, gpu_id=3)
 """
 
@@ -25,7 +25,7 @@ def init(log_dir: Path | str = "/tmp") -> None:
     global _logger
     if _logger is not None:
         return
-    log_path = Path(log_dir) / "ripe_autotrain_msgs.log"
+    log_path = Path(log_dir) / "ripe_grm_msgs.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     handler = logging.FileHandler(log_path, encoding="utf-8")
@@ -33,7 +33,7 @@ def init(log_dir: Path | str = "/tmp") -> None:
         "%(asctime)s  %(levelname)-7s  %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     ))
-    _logger = logging.getLogger("ripe_autotrain")
+    _logger = logging.getLogger("ripe_grm")
     _logger.setLevel(logging.DEBUG)
     _logger.addHandler(handler)
     _logger.propagate = False

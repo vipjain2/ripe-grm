@@ -8,8 +8,8 @@ import sys
 import time
 from pathlib import Path
 
-from ripe_autotrain.compute_backend_client import BackendClient, GPU
-from ripe_autotrain.dashboard_log import log_debug, log_error
+from ripe_grm.compute_backend_client import BackendClient, GPU
+from ripe_grm.dashboard_log import log_debug, log_error
 
 _TRAINING_DIR    = Path.cwd()
 BACKEND_REGISTRY = _TRAINING_DIR / "compute_registry.json"

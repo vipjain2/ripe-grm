@@ -18,9 +18,9 @@ import sys
 import time
 from pathlib import Path
 
-from ripe_autotrain.compute_backend_client import SocketJobHandle
-from ripe_autotrain.compute_backend_server import _BackendServer, _BaseGPUServer
-from ripe_autotrain.dashboard_log import log_debug, log_error
+from ripe_grm.compute_backend_client import SocketJobHandle
+from ripe_grm.compute_backend_server import _BackendServer, _BaseGPUServer
+from ripe_grm.dashboard_log import log_debug, log_error
 
 DEFAULT_BACKEND_SOCK = "/tmp/drl_backend.sock"
 

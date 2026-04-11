@@ -1,11 +1,11 @@
-# Ripe AutoTrain
+# Ripe GRM
 
-Ripe AutoTrain is a GPU management and training automation app for managing and monitoring reinforcement learning training runs.
+Ripe GRM is a GPU management and training automation app for managing and monitoring reinforcement learning training runs.
 
 ## Installation
 
 ```bash
-pip install -e /path/to/ripe_autotrain
+pip install -e /path/to/ripe_grm
 ```
 
 ## Usage
@@ -14,7 +14,7 @@ Run from your training project directory:
 
 ```bash
 cd /path/to/your/training/project
-ripe_autotrain
+ripe_grm
 ```
 
 The dashboard reads configuration from the current working directory.
@@ -23,7 +23,7 @@ The dashboard reads configuration from the current working directory.
 
 ## Configuration files
 
-Both files live in your **training project directory** (where you invoke `ripe_autotrain`).
+Both files live in your **training project directory** (where you invoke `ripe_grm`).
 
 ### `compute_registry.json`
 

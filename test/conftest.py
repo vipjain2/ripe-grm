@@ -44,7 +44,7 @@ class FakeGPU:
     backend_id    = "local"
 
     def status(self):
-        from ripe_autotrain.compute_backend_client import GPUStatus
+        from ripe_grm.compute_backend_client import GPUStatus
         return GPUStatus(util_pct=0, temp_c=40, mem_used_mb=100, mem_total_mb=8192)
 
     def submit(self, config):
@@ -64,12 +64,12 @@ def _patch_backends():
     backend_mock = MagicMock()
     backend_mock.init_backends.return_value = ([], {}, [FAKE_GPU], 1)
     backend_mock.live_jobs.return_value = {}
-    sys.modules["ripe_autotrain.dashboard_backend"] = backend_mock
+    sys.modules["ripe_grm.dashboard_backend"] = backend_mock
     yield
-    sys.modules.pop("ripe_autotrain.dashboard_backend", None)
+    sys.modules.pop("ripe_grm.dashboard_backend", None)
     # Also remove dashboard so it gets re-imported fresh if needed
     for mod in list(sys.modules):
-        if "ripe_autotrain.dashboard" in mod:
+        if "ripe_grm.dashboard" in mod:
             sys.modules.pop(mod, None)
 
 

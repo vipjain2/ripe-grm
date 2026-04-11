@@ -6,12 +6,12 @@ import subprocess
 import time
 from pathlib import Path
 
-from ripe_autotrain.compute_backend_client import GPU, JobConfig
-from ripe_autotrain.dashboard_backend import init_backends, live_jobs
-from ripe_autotrain.dashboard_experiments import ExperimentsMixin, _load_defaults
-from ripe_autotrain.dashboard_log import init as _init_log, log_error
-from ripe_autotrain.dashboard_tasks import TasksMixin, TasksTab, LOG_DIR
-from ripe_autotrain.dashboard_train_runs import TrainingRun
+from ripe_grm.compute_backend_client import GPU, JobConfig
+from ripe_grm.dashboard_backend import init_backends, live_jobs
+from ripe_grm.dashboard_experiments import ExperimentsMixin, _load_defaults
+from ripe_grm.dashboard_log import init as _init_log, log_error
+from ripe_grm.dashboard_tasks import TasksMixin, TasksTab, LOG_DIR
+from ripe_grm.dashboard_train_runs import TrainingRun
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -19,6 +19,12 @@ from textual.widget import Widget
 from textual.widgets import (
     Button, DataTable, Footer, Header,
     Static, TabbedContent, TabPane,
+)
+from textual.widgets._toast import ToastHolder
+
+# Move notifications to bottom-left so they don't overlap the Submit button.
+ToastHolder.DEFAULT_CSS = ToastHolder.DEFAULT_CSS.replace(
+    "align-horizontal: right;", "align-horizontal: left;"
 )
 
 _TRAINING_DIR = Path.cwd()
@@ -90,6 +96,8 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
     #gpu-status { height: auto; }
     #queue-actions { height: 3; align: right middle; padding: 0 2; }
     #queue-submit { width: auto; min-width: 16; }
+    #queue-submit:focus { text-style: none; }
+    #queue-submit.-active { background: $success; }
     SpawnModal { align: center middle; }
     #spawn-dialog {
         width: 52; height: 80vh;
@@ -140,9 +148,10 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
         queue_table.add_columns("Name", "GPU", "Changed Params")
 
         self._load_config()
+        self._load_queue()
         self._load_state()
         self._load_existing_runs()
-        self._load_queue()
+        self._scan_disk_completed()
         self.set_interval(1.0, self._tick)
 
     # -----------------------------------------------------------------------
@@ -240,9 +249,42 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
             self.runs.append(run)
             seen.add(run_name)
             if handle:
-                # Always start reader — cloud logs stream via socket regardless
-                # of whether the dashboard-side log file exists locally
                 run.start_reader()
+
+        # Pick up any live handles not matched by saved state
+        for name, handle in live.items():
+            if name in seen or not name:
+                continue
+            chain_exp, chain_idx, chain_total = self._infer_chain(name)
+            run = TrainingRun(
+                run_name          = name,
+                gpu_id            = handle.gpu_id,
+                params            = self._params_for_run(name),
+                handle            = handle,
+                log_file          = handle.log_file,
+                status            = "running",
+                chain_experiment  = chain_exp,
+                chain_task_idx    = chain_idx,
+                chain_total_tasks = chain_total,
+            )
+            if handle.log_file:
+                run.start_reader()
+            self.runs.append(run)
+            seen.add(name)
+
+    def _infer_chain(self, run_name: str) -> tuple[str | None, int, int]:
+        """Match a run name like 'ppo_exp8_3' to a queued multi-step experiment.
+
+        Returns (chain_experiment, chain_task_idx, chain_total_tasks).
+        """
+        for exp in self.experiment_queue:
+            exp_name = exp.get("run_name", "")
+            tasks = exp.get("tasks") or [exp]
+            if len(tasks) > 1 and run_name.startswith(exp_name + "_"):
+                suffix = run_name[len(exp_name) + 1:]
+                if suffix.isdigit():
+                    return exp_name, int(suffix) - 1, len(tasks)
+        return None, 0, 1
 
     def _load_existing_runs(self) -> None:
         seen = {r.run_name for r in self.runs}
@@ -262,6 +304,7 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
             if run_name in seen:
                 continue
             handle = live.get(run_name)
+            chain_exp, chain_idx, chain_total = self._infer_chain(run_name)
             run = TrainingRun(
                 run_name=run_name,
                 gpu_id=handle.gpu_id if handle else None,
@@ -269,6 +312,9 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
                 params=self._params_for_run(run_name),
                 status="running" if handle else "stopped",
                 log_file=handle.log_file if handle else "",
+                chain_experiment=chain_exp,
+                chain_task_idx=chain_idx,
+                chain_total_tasks=chain_total,
             )
             self.runs.append(run)
             if handle:
@@ -326,13 +372,34 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
 
         self._refresh_table()
 
+        # Refresh experiments table when run states change
+        run_snapshot = tuple((r.run_name, r.status) for r in self.runs)
+        if run_snapshot != getattr(self, "_last_run_snapshot", None):
+            self._last_run_snapshot = run_snapshot
+            self._refresh_queue_table()
+
     def _poll_cloud_runs(self) -> None:
-        """Detect cloud jobs tracked by the backend but not yet in self.runs."""
-        seen = {r.run_name for r in self.runs}
+        """Detect cloud jobs tracked by the backend but not yet in self.runs,
+        and reconnect stopped runs that the backend now reports as running."""
+        runs_by_name = {r.run_name: r for r in self.runs}
         for handle in (j for b in _backends for j in b.running_jobs()):
-            if handle.run_name in seen or not handle.run_name:
+            if not handle.run_name:
                 continue
-            gpu = self._gpu_by_index(handle.gpu_id)
+            existing = runs_by_name.get(handle.run_name)
+            if existing is not None:
+                # Reconnect a stopped run if the backend says it's alive
+                if existing.status == "stopped" and existing.handle is None:
+                    existing.handle = handle
+                    existing.status = "running"
+                    existing.log_file = handle.log_file or existing.log_file
+                    existing.gpu_id = handle.gpu_id
+                    if handle.log_file:
+                        existing.start_reader()
+                    self._save_state()
+                    self.call_from_thread(self._refresh_queue_table)
+                    self.notify(f"Reconnected run: {handle.run_name}", timeout=5)
+                continue
+            chain_exp, chain_idx, chain_total = self._infer_chain(handle.run_name)
             run = TrainingRun(
                 run_name = handle.run_name,
                 gpu_id   = handle.gpu_id,
@@ -340,11 +407,16 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
                 handle   = handle,
                 log_file = handle.log_file,
                 status   = "running",
+                chain_experiment  = chain_exp,
+                chain_task_idx    = chain_idx,
+                chain_total_tasks = chain_total,
             )
             if handle.log_file:
                 run.start_reader()
             self.runs.append(run)
-            seen.add(handle.run_name)
+            runs_by_name[handle.run_name] = run
+            self._save_state()
+            self.call_from_thread(self._refresh_queue_table)
             self.notify(f"Detected cloud run: {handle.run_name}", timeout=5)
 
     def _refresh_gpus(self) -> None:
@@ -380,7 +452,7 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
                     return f"{gpu.name:<20s}  [green]instance running[/green]{cost_str}{total_str}{id_str}"
                 if s.instance_state == "offline":
                     return f"{gpu.name:<20s}  [yellow]instance offline[/yellow]{id_str}"
-                return f"{gpu.name:<20s}  [dim]idle — no instance[/dim]"
+                return f"{gpu.name:<20s}  [dim]No instance[/dim]"
             bar_filled = s.util_pct // 5
             bar        = "█" * bar_filled + "░" * (20 - bar_filled)
             temp_color = "red" if s.temp_c >= 80 else "yellow" if s.temp_c >= 70 else "green"
@@ -398,7 +470,7 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
         for backend_id, gpus in groups.items():
             if lines:
                 lines.append("")
-            lines.append(f"[bold]{backend_id}[/bold]")
+            lines.append(f"[bold]{backend_id.capitalize()}[/bold]")
             lines.extend(_gpu_line(g) for g in gpus)
 
         if lines:

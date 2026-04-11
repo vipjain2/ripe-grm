@@ -24,8 +24,8 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from ripe_autotrain.compute_backend_client import SocketJobHandle
-from ripe_autotrain.dashboard_log import log_debug, log_error
+from ripe_grm.compute_backend_client import SocketJobHandle
+from ripe_grm.dashboard_log import log_debug, log_error
 
 
 # ---------------------------------------------------------------------------
