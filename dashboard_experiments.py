@@ -204,8 +204,6 @@ class ExperimentsMixin:
         self._disk_completed: dict[str, int] = {}  # run_name → last completed task index
         for exp in self.experiment_queue:
             tasks = exp.get("tasks") or [exp]
-            if len(tasks) <= 1:
-                continue
             run_name = exp.get("run_name", "")
             next_idx, _ = self._find_completed_step(run_name, tasks)
             # next_idx is the next task to run; completed_up_to = next_idx - 1
@@ -217,8 +215,6 @@ class ExperimentsMixin:
         if exp is None:
             return
         tasks = exp.get("tasks") or [exp]
-        if len(tasks) <= 1:
-            return
         next_idx, _ = self._find_completed_step(run_name, tasks)
         self._disk_completed[run_name] = next_idx - 1
 
@@ -340,7 +336,6 @@ class ExperimentsMixin:
         for exp_idx, exp in enumerate(self.experiment_queue):
             tasks = exp.get("tasks") or [exp]
             run_name = exp.get("run_name", "-")
-            multi = len(tasks) > 1
 
             exp_runs = self._exp_runs(run_name)
             done_run = next(
@@ -588,7 +583,6 @@ class ExperimentsMixin:
         exp      = self.experiment_queue[idx]
         run_name = exp["run_name"]
         tasks    = exp.get("tasks") or [exp]
-        multi    = len(tasks) > 1
 
         # Block if a run is already active for this experiment
         if any(r.status == "running" for r in self._exp_runs(run_name)):
@@ -604,39 +598,26 @@ class ExperimentsMixin:
             (r for r in self._exp_runs(run_name) if r.status in ("stopped", "killed", "error")),
             None,
         )
-        if multi:
-            disk_idx, disk_ckpt = self._find_completed_step(run_name, tasks)
-            if existing is not None:
-                # Use the more advanced of: tracked run state vs. disk scan
-                if existing.status == "stopped":
-                    tracked_idx = existing.chain_task_idx + 1
-                else:
-                    tracked_idx = existing.chain_task_idx
-                start_task_idx = max(disk_idx, tracked_idx)
-                # Pick checkpoint from the step just before start_task_idx
-                prev_run = f"{run_name}_{start_task_idx}"
-                candidates = [c for c in self._checkpoints(prev_run)
-                              if "_latest" not in c.stem]
-                checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else disk_ckpt
-                self.runs.remove(existing)
-            else:
-                start_task_idx = disk_idx
-                checkpoint = disk_ckpt
-            if start_task_idx >= len(tasks):
-                self.notify(f"{run_name}: all {len(tasks)} steps already completed.", severity="warning")
-                return
-        elif existing is not None:
+        disk_idx, disk_ckpt = self._find_completed_step(run_name, tasks)
+        if existing is not None:
+            # Use the more advanced of: tracked run state vs. disk scan
             if existing.status == "stopped":
-                start_task_idx = existing.chain_task_idx + 1
+                tracked_idx = existing.chain_task_idx + 1
             else:
-                start_task_idx = existing.chain_task_idx
-            if start_task_idx >= len(tasks):
-                self.notify(f"{run_name}: all {len(tasks)} steps already completed.", severity="warning")
-                return
-            candidates = [c for c in self._checkpoints(existing.run_name)
+                tracked_idx = existing.chain_task_idx
+            start_task_idx = max(disk_idx, tracked_idx)
+            # Pick checkpoint from the step just before start_task_idx
+            prev_run = f"{run_name}_{start_task_idx}"
+            candidates = [c for c in self._checkpoints(prev_run)
                           if "_latest" not in c.stem]
-            checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
+            checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else disk_ckpt
             self.runs.remove(existing)
+        else:
+            start_task_idx = disk_idx
+            checkpoint = disk_ckpt
+        if start_task_idx >= len(tasks):
+            self.notify(f"{run_name}: all {len(tasks)} steps already completed.", severity="warning")
+            return
 
         # Per-step GPU preference overrides experiment-level preference
         pref = tasks[start_task_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
@@ -664,19 +645,18 @@ class ExperimentsMixin:
             self.notify(f"No ready GPU available{f' on {pref}' if pref != 'any' else ''}.", severity="error")
             return
 
-        # Multi-step experiments get a _N suffix on the run name
-        actual_run_name = f"{run_name}_{start_task_idx + 1}" if multi else run_name
+        # Always add a _N suffix on the run name
+        actual_run_name = f"{run_name}_{start_task_idx + 1}"
         launch_config = {**tasks[start_task_idx], "run_name": actual_run_name,
                          "gpu_id": gpu.index, "backend_id": gpu.backend_id}
         if checkpoint:
             launch_config["checkpoint"] = checkpoint
         def _on_submitted(new_run) -> None:
-            if multi:
-                new_run.chain_experiment  = run_name
-                new_run.chain_task_idx    = start_task_idx
-                new_run.chain_total_tasks = len(tasks)
-                self._save_state()
-            step_label = f" (step {start_task_idx + 1}/{len(tasks)})" if multi else ""
+            new_run.chain_experiment  = run_name
+            new_run.chain_task_idx    = start_task_idx
+            new_run.chain_total_tasks = len(tasks)
+            self._save_state()
+            step_label = f" (step {start_task_idx + 1}/{len(tasks)})"
             self.notify(f"Submitted {actual_run_name}{step_label} on GPU {gpu.index} — waiting for task to start", timeout=8)
 
         self._on_spawn_result(launch_config, on_ready=_on_submitted)
