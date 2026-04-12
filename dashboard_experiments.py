@@ -346,9 +346,11 @@ class ExperimentsMixin:
             running_run = next(
                 (r for r in exp_runs if r.status == "running"), None,
             )
-            tracked = done_run.chain_task_idx if done_run is not None else -1
-            disk = getattr(self, '_disk_completed', {}).get(run_name, -1)
-            completed_up_to = max(tracked, disk)
+            # Step completion is anchored on the disk scan (checkpoint meta
+            # with status=complete), NOT on done_run.chain_task_idx. A run that
+            # crashed without producing a completed checkpoint will still have
+            # a chain_task_idx, but the step is not done.
+            completed_up_to = getattr(self, '_disk_completed', {}).get(run_name, -1)
             running_idx = running_run.chain_task_idx if running_run is not None else None
 
             def step_mark(task_idx: int) -> str:
@@ -592,31 +594,17 @@ class ExperimentsMixin:
             return
 
         # Find the next step to run by scanning checkpoint files on disk.
-        # This is the source of truth — the tracked run's chain_task_idx can be
-        # stale if the dashboard lost connection while steps completed remotely.
-        start_task_idx = 0
-        checkpoint     = None
+        # Disk is the source of truth: a step only counts as done if its
+        # checkpoint has status=complete in the JSON companion. A prior run's
+        # `status = "stopped"` can mean the process crashed with no traceback
+        # in the local log buffer, so we can't trust it to mean "step finished."
+        start_task_idx, checkpoint = self._find_completed_step(run_name, tasks)
         existing = next(
             (r for r in self._exp_runs(run_name) if r.status in ("stopped", "killed", "error")),
             None,
         )
-        disk_idx, disk_ckpt = self._find_completed_step(run_name, tasks)
         if existing is not None:
-            # Use the more advanced of: tracked run state vs. disk scan
-            if existing.status == "stopped":
-                tracked_idx = existing.chain_task_idx + 1
-            else:
-                tracked_idx = existing.chain_task_idx
-            start_task_idx = max(disk_idx, tracked_idx)
-            # Pick checkpoint from the step just before start_task_idx
-            prev_run = f"{run_name}_{start_task_idx}"
-            candidates = [c for c in self._checkpoints(prev_run)
-                          if "_latest" not in c.stem]
-            checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else disk_ckpt
             self.runs.remove(existing)
-        else:
-            start_task_idx = disk_idx
-            checkpoint = disk_ckpt
         if start_task_idx >= len(tasks):
             self.notify(f"{run_name}: all {len(tasks)} steps already completed.", severity="warning")
             return
