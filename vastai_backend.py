@@ -268,6 +268,7 @@ class _VastGPUServer(_BaseGPUServer):
                                                  "mem_used_mb": 0, "mem_total_mb": 0}
         self._status_lock    = threading.Lock()
         self._last_status_t: float           = 0.0
+        self._status_fail_count: int         = 0
 
     # -- Job-state helpers (called with self._lock held) ---------------------
 
@@ -294,6 +295,7 @@ class _VastGPUServer(_BaseGPUServer):
         with self._status_lock:
             self._status_cache = {"util_pct": 0, "temp_c": 0,
                                   "mem_used_mb": 0, "mem_total_mb": 0}
+            self._status_fail_count = 0
 
     # -- Session restore -----------------------------------------------------
 
@@ -366,6 +368,16 @@ class _VastGPUServer(_BaseGPUServer):
         if not instance_id:
             return
 
+        # 0. Rediscovery: attached slot that thinks it's idle may have a
+        # training process that started out-of-band (or was lost to an
+        # earlier buggy cleanup). Cheap SSH scan; only runs when idle.
+        if training_status == "idle" and ssh is not None:
+            self._try_rediscover_training(ssh, instance_id)
+            with self._lock:
+                training_status = self._training_status
+                run_name        = self._run_name or ""
+                remote_log      = self._remote_log
+
         # 1. Instance heartbeat
         is_alive = self._heartbeat()
 
@@ -401,16 +413,17 @@ class _VastGPUServer(_BaseGPUServer):
                     if self._instance_id == instance_id:
                         self._ssh_fail_polls += 1
                         ssh_fails = self._ssh_fail_polls
-                if ssh_fails >= 5:
-                    # 5 consecutive SSH failures (~50s) — treat as process not found
-                    log_error("SSH pgrep failed 5x in a row; assuming training ended",
+                # SSH outage: do NOT conclude the process ended. Keep the
+                # tracked state and retry next poll. Surface a single error
+                # at the 5-fail mark so the user notices, then stay quiet.
+                if ssh_fails == 5:
+                    log_error("SSH unreachable for 5 polls; retaining state",
                               instance_id=instance_id, run_name=run_name, error=str(e))
-                    process_found = False
                 else:
                     log_debug("pgrep SSH check failed; retaining current state",
                               instance_id=instance_id, run_name=run_name,
                               fail_count=ssh_fails, error=str(e))
-                    process_found = None  # unknown — keep current state
+                process_found = None  # unknown — keep current state
 
             # If staged run not found, do a broad scan for any train.py process.
             # Only when in "running" state — in "submitted" state the process
@@ -590,9 +603,62 @@ class _VastGPUServer(_BaseGPUServer):
                     "mem_used_mb": int(mem_used),
                     "mem_total_mb": int(mem_total),
                 }
+                self._status_fail_count = 0
         except Exception as e:
+            with self._status_lock:
+                self._status_fail_count += 1
+                # After 3 consecutive failures (~90s) the cached values are
+                # stale enough to mislead. Zero them so the GPU panel shows
+                # the SSH outage instead of frozen numbers.
+                if self._status_fail_count >= 3:
+                    self._status_cache = {"util_pct": 0, "temp_c": 0,
+                                          "mem_used_mb": 0, "mem_total_mb": 0}
             log_debug("nvidia-smi SSH fetch failed", instance_id=self._instance_id,
                       error=str(e))
+
+    def _try_rediscover_training(self, ssh: InstanceSSH,
+                                  instance_id: str) -> None:
+        """Scan the instance for an out-of-band train.py --run-name process.
+
+        Called from _poll when the slot is attached but marked idle. If a
+        matching process is found, the slot is promoted back to "running"
+        with _run_name extracted from the process args. Silent on SSH
+        errors — we'll retry next poll.
+        """
+        try:
+            ps_out = ssh.run(
+                "ps -eo args | grep 'train.py' | grep -- '--run-name' "
+                "| grep -v grep | head -1",
+                timeout=10)
+        except Exception as e:
+            log_debug("rediscovery ps scan failed",
+                      instance_id=instance_id, error=str(e))
+            return
+
+        parts = ps_out.split()
+        if "--run-name" not in parts:
+            return
+        idx = parts.index("--run-name")
+        if idx + 1 >= len(parts):
+            return
+        discovered = parts[idx + 1]
+
+        with self._lock:
+            # Ensure we still own this slot and it's still idle before promoting
+            if self._instance_id != instance_id or self._training_status != "idle":
+                return
+            Path(self._local_log).unlink(missing_ok=True)
+            self._run_name        = discovered
+            self._log_file        = self._local_log
+            self._remote_log      = ""   # discovered on next poll
+            self._training_status = "running"
+            self._submitted_at    = 0.0
+            self._absent_training = 0
+            self._ssh_fail_polls  = 0
+            self._log_offset      = 0
+            self._log_complete    = False
+        log_debug("rediscovered train.py process",
+                  instance_id=instance_id, run_name=discovered)
 
     # -- Hardware-specific commands -----------------------------------------
 
@@ -806,23 +872,28 @@ class VastBackend:
                 idle.start()
                 self._servers[slot_id] = idle
 
-            # Build SSH connection and discover running training process (if any)
+            # Build SSH connection and discover running training process (if any).
+            # Only treat the slot as "running a job" if we can extract a real
+            # run_name from the process args — never fall back to the instance
+            # label, which would poison checkpoint paths and tracking.
             instance_id_str = str(info["id"])
             ssh = InstanceSSH.from_instance(info)
-            run_name = info.get("label") or f"instance-{instance_id_str}"
-            training_found = False
+            discovered_run_name: str | None = None
             try:
                 ps_out = ssh.run(
-                    "ps -eo args | grep 'train.py' | grep -v grep | head -1",
+                    "ps -eo args | grep 'train.py' | grep -- '--run-name' "
+                    "| grep -v grep | head -1",
                     timeout=10)
                 parts = ps_out.split()
-                training_found = bool(parts)
                 if "--run-name" in parts:
-                    run_name = parts[parts.index("--run-name") + 1]
+                    idx = parts.index("--run-name")
+                    if idx + 1 < len(parts):
+                        discovered_run_name = parts[idx + 1]
             except Exception as e:
                 log_debug("SSH process discovery failed during attach",
                           instance_id=instance_id_str, error=str(e))
 
+            training_found = discovered_run_name is not None
             total_cost = _instance_total_cost(instance_id_str)
             with idle._lock:
                 idle._instance_id     = instance_id_str
@@ -831,7 +902,7 @@ class VastBackend:
                 idle._ssh             = ssh
                 idle._cost_per_hour   = float(info.get("dph_total", 0.0))
                 idle._total_cost      = total_cost
-                idle._run_name        = run_name if training_found else None
+                idle._run_name        = discovered_run_name
                 idle._log_file        = idle._local_log if training_found else ""
                 idle._remote_log      = "" if training_found else None
                 idle._training_status = "running" if training_found else "idle"
