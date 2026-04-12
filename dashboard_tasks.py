@@ -106,29 +106,45 @@ class TasksMixin:
             lines.append("  checkpoint: (none)")
         # Trained iterations
         trained = run.steps + run.steps_offset
-        lines.append(f"  trained iterations: {trained:,}")
-        # Params
-        params = self._params_for_run(run.run_name)
+        if trained == 0:
+            lines.append("  trained iterations: 0 (no log data)")
+        else:
+            lines.append(f"  trained iterations: {trained:,}")
+        # Params — only show tunable keys (those present in defaults), so we
+        # don't spuriously mark internal fields like obs_dim as overrides.
+        params_file = self._params_file_for_run(run.run_name)
+        if params_file is None:
+            params = dict(_load_defaults())
+            lines.append("  params: (not downloaded — showing defaults)")
+        else:
+            with open(params_file) as f:
+                params = json.load(f)
         defaults = dict(_load_defaults())
-        for k, v in params.items():
-            if k in ("run_name", "status"):
+        for k, default in defaults.items():
+            if k not in params:
                 continue
-            default = defaults.get(k)
-            marker = "" if default is not None and v == default else " *"
+            v = params[k]
+            marker = "" if v == default else " *"
             lines.append(f"  {k}: {v}{marker}")
         lines.append("───────────────────")
         return lines
 
-    def _params_for_run(self, run_name: str) -> dict:
+    def _params_file_for_run(self, run_name: str) -> Path | None:
+        """Return the latest params JSON for a run, or None if not found."""
         if _OUTPUT_DIR:
             candidates = list(_OUTPUT_DIR.glob(f"{run_name}_*.json")) + list(_OUTPUT_DIR.glob(f"{run_name}.json"))
         else:
             candidates = list(_TRAINING_DIR.rglob(f"{run_name}_*.json")) + list(_TRAINING_DIR.rglob(f"{run_name}.json"))
-        if candidates:
-            latest = max(candidates, key=lambda p: p.stat().st_mtime)
-            with open(latest) as f:
-                return json.load(f)
-        return dict(_load_defaults())
+        if not candidates:
+            return None
+        return max(candidates, key=lambda p: p.stat().st_mtime)
+
+    def _params_for_run(self, run_name: str) -> dict:
+        params_file = self._params_file_for_run(run_name)
+        if params_file is None:
+            return dict(_load_defaults())
+        with open(params_file) as f:
+            return json.load(f)
 
     def _selected_run(self) -> "TrainingRun | None":
         if not self.selected_run_name:
