@@ -124,7 +124,7 @@ class TasksMixin:
             if k not in params:
                 continue
             v = params[k]
-            marker = "" if v == default else " *"
+            marker = "" if v == default else "  <--"
             lines.append(f"  {k}: {v}{marker}")
         lines.append("───────────────────")
         return lines
