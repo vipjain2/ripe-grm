@@ -191,7 +191,7 @@ class _RunPodGPUServer(_BaseGPUServer):
 
     @property
     def python_cmd(self) -> list[str]:
-        return ["python", "-u"]
+        return ["uv", "run", "--project", "/app", "python", "-u"]
 
     def __init__(self, slot_id: int, backend: "RunPodBackend"):
         super().__init__(slot_id, f"RunPod Slot {slot_id}",
@@ -424,8 +424,11 @@ class _RunPodGPUServer(_BaseGPUServer):
             training_status in ("submitted", "running") and not is_training_alive
         )
         if is_downloading and not self._log_complete:
+            self._append_local_log("[runpod] Downloading final logs from pod...")
             self._fetch_log_lines(ssh, remote_log, final=True)
+            self._append_local_log("[runpod] Downloading checkpoints from pod...")
             self._download_checkpoints(ssh, run_name, instance_id)
+            self._append_local_log("[runpod] Download complete.")
             with self._lock:
                 if self._instance_id == instance_id:
                     self._on_job_ended()
@@ -434,6 +437,11 @@ class _RunPodGPUServer(_BaseGPUServer):
         if time.time() - self._last_status_t >= self._STATUS_MIN_SECS:
             self._refresh_status_cache(ssh)
             self._last_status_t = time.time()
+
+    def _append_local_log(self, message: str) -> None:
+        """Append a status message to the local log file."""
+        with open(self._local_log, "a") as f:
+            f.write(message + "\n")
 
     def _fetch_log_lines(self, ssh: InstanceSSH, remote_log: str,
                          final: bool = False) -> None:
