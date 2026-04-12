@@ -67,15 +67,15 @@ def _get_pods() -> list[dict]:
 
 
 def _get_pod(pod_id: str) -> dict | None:
-    """Return pod info dict, or None if not found."""
-    try:
-        pod = runpod.get_pod(pod_id)
-        if isinstance(pod, dict) and pod.get("id"):
-            return pod
-        return None
-    except Exception as e:
-        log_error("get_pod failed", exc=e, pod_id=pod_id)
-        return None
+    """Return pod info dict, or None if not found.
+
+    Raises on SDK/network errors so callers can distinguish
+    'pod confirmed gone' from 'could not check'.
+    """
+    pod = runpod.get_pod(pod_id)
+    if isinstance(pod, dict) and pod.get("id"):
+        return pod
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -138,29 +138,39 @@ class InstanceSSH:
     def from_pod(cls, pod: dict) -> "InstanceSSH":
         """Build from a RunPod pod info dict.
 
-        RunPod exposes SSH via publicIp + mapped port for internal port 22,
-        found in the portMappings field: {"22": <external_port>}.
+        RunPod exposes SSH via runtime.ports — find the entry mapping
+        privatePort=22 to a public IP/port.
         """
+        runtime = pod.get("runtime") or {}
+        for p in runtime.get("ports") or []:
+            if p.get("privatePort") == 22 and p.get("isIpPublic"):
+                return cls(p["ip"], int(p["publicPort"]))
+        # Fallback: top-level publicIp with portMappings (older SDK shape)
         host = pod.get("publicIp")
-        if not host:
-            raise RuntimeError(f"Pod {pod.get('id')} has no publicIp")
-        # portMappings maps internal -> external, e.g. {"22": 10341}
-        mappings = pod.get("portMappings") or {}
-        port = int(mappings.get("22", 22))
-        return cls(host, port)
+        if host:
+            mappings = pod.get("portMappings") or {}
+            return cls(host, int(mappings.get("22", 22)))
+        raise RuntimeError(f"Pod {pod.get('id')} has no SSH endpoint (runtime not ready?)")
 
 
 def _ssh_execute_async(ssh: InstanceSSH, cmd: str, pod_id: str = "") -> None:
-    """Fire-and-forget command via SSH in a background thread."""
+    """Fire-and-forget with connection error detection.
+
+    Uses ssh -f which backgrounds only after successful authentication.
+    Connection/auth failures exit immediately with a non-zero code.
+    """
     def _run() -> None:
         try:
-            out = ssh.run(cmd, timeout=30)
-            if out.strip():
-                log_debug("ssh execute output", pod_id=pod_id,
-                          cmd=cmd[:80], output=out[:500])
-        except Exception as e:
-            log_error("ssh execute failed", exc=e, pod_id=pod_id,
-                      cmd=cmd[:80])
+            result = subprocess.run(
+                ["ssh", "-f", f"-p{ssh.port}", *_SSH_OPTS, f"root@{ssh.host}", cmd],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, text=True, timeout=30,
+            )
+            if result.returncode != 0 and result.stderr.strip():
+                log_error("ssh execute failed", pod_id=pod_id,
+                          cmd=cmd[:80], error=result.stderr.strip()[:500])
+        except subprocess.TimeoutExpired:
+            log_error("ssh execute timed out", pod_id=pod_id, cmd=cmd[:80])
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -668,7 +678,10 @@ class RunPodBackend:
     def _attach_untracked_pods(self) -> None:
         """Discover running RunPod pods not yet tracked and attach to idle slots."""
         pods = _get_pods()
-        running = [p for p in pods if p.get("desiredStatus") == "RUNNING"]
+        # desiredStatus is the target — runtime is populated only once the pod
+        # is actually started and SSH is reachable. Skip provisioning pods.
+        running = [p for p in pods
+                   if p.get("desiredStatus") == "RUNNING" and p.get("runtime")]
 
         tracked = set()
         for server in self._servers.values():

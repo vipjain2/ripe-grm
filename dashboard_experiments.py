@@ -284,9 +284,11 @@ class ExperimentsMixin:
         checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime)) if candidates else None
         # Per-step GPU preference overrides experiment-level preference
         pref = tasks[next_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
-        used = {r.gpu_id for r in self.runs if r.status == "running" and r.gpu_id is not None}
+        used = {(getattr(r.handle, "backend_id", None), r.gpu_id)
+                for r in self.runs
+                if r.status == "running" and r.gpu_id is not None}
         def _gpu_ready(g) -> bool:
-            if g.index in used:
+            if (g.backend_id, g.index) in used:
                 return False
             if g.backend_id != "local":
                 try:
@@ -621,10 +623,12 @@ class ExperimentsMixin:
 
         # Per-step GPU preference overrides experiment-level preference
         pref = tasks[start_task_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
-        used = {r.gpu_id for r in self.runs if r.status == "running" and r.gpu_id is not None}
+        used = {(getattr(r.handle, "backend_id", None), r.gpu_id)
+                for r in self.runs
+                if r.status == "running" and r.gpu_id is not None}
         def _gpu_ready(g) -> bool:
             """True if the GPU slot is free and ready to accept a job."""
-            if g.index in used:
+            if (g.backend_id, g.index) in used:
                 return False
             if g.backend_id != "local":
                 try:

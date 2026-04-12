@@ -85,15 +85,15 @@ def _show_instances() -> list[dict]:
 
 
 def _get_instance(instance_id: str) -> dict | None:
-    """Return instance info dict, or None if not found."""
-    try:
-        result = _parse_response(_sdk().show_instance(id=int(instance_id)))
-        if isinstance(result, dict) and result.get("id"):
-            return result
-        return None
-    except Exception as e:
-        log_error("get_instance SDK call failed", exc=e, instance_id=instance_id)
-        return None
+    """Return instance info dict, or None if not found.
+
+    Raises on SDK/network errors so callers can distinguish
+    'instance confirmed gone' from 'could not check'.
+    """
+    result = _parse_response(_sdk().show_instance(id=int(instance_id)))
+    if isinstance(result, dict) and result.get("id"):
+        return result
+    return None
 
 
 def _instance_total_cost(instance_id: str) -> float:
@@ -111,16 +111,23 @@ def _instance_total_cost(instance_id: str) -> float:
 
 
 def _ssh_execute_async(ssh: "InstanceSSH", cmd: str, instance_id: str = "") -> None:
-    """Fire-and-forget command via SSH in a background thread."""
+    """Fire-and-forget with connection error detection.
+
+    Uses ssh -f which backgrounds only after successful authentication.
+    Connection/auth failures exit immediately with a non-zero code.
+    """
     def _run() -> None:
         try:
-            out = ssh.run(cmd, timeout=30)
-            if out.strip():
-                log_debug("ssh execute output", instance_id=instance_id,
-                          cmd=cmd[:80], output=out[:500])
-        except Exception as e:
-            log_error("ssh execute failed", exc=e, instance_id=instance_id,
-                      cmd=cmd[:80])
+            result = subprocess.run(
+                ["ssh", "-f", f"-p{ssh.port}", *_SSH_OPTS, f"root@{ssh.host}", cmd],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, text=True, timeout=30,
+            )
+            if result.returncode != 0 and result.stderr.strip():
+                log_error("ssh execute failed", instance_id=instance_id,
+                          cmd=cmd[:80], error=result.stderr.strip()[:500])
+        except subprocess.TimeoutExpired:
+            log_error("ssh execute timed out", instance_id=instance_id, cmd=cmd[:80])
     threading.Thread(target=_run, daemon=True).start()
 
 
@@ -667,7 +674,7 @@ class _VastGPUServer(_BaseGPUServer):
                 cmd += f" --{key.replace('_', '-')} {val}"
             if chk:
                 cmd += f" --checkpoint {chk}"
-            cmd += f" > {remote_log} 2>&1 </dev/null & disown"
+            cmd += f" > {remote_log} 2>&1 & disown"
             # Launch via SSH in background thread — non-blocking
             _ssh_execute_async(ssh, cmd, instance_id=instance_id)
             # Poll thread will confirm the process started and transition to "running"

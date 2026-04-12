@@ -100,14 +100,24 @@ class _BaseGPUServer(ABC):
 
     def _heartbeat(self) -> bool:
         """Run one heartbeat check. Returns True if instance is alive.
-        Updates _instance_state and _absent_polls. Calls _on_instance_detached
-        when the instance is confirmed gone after _ABSENT_THRESHOLD polls."""
+        Updates _instance_state and _absent_polls.
+
+        _check_instance_alive should return info dict if alive, None if
+        confirmed gone, or raise on transient errors (network/API failures).
+        Transient errors do NOT increment _absent_polls."""
         with self._lock:
             instance_id = self._instance_id
         if not instance_id:
             return False
 
-        info = self._check_instance_alive(instance_id)
+        try:
+            info = self._check_instance_alive(instance_id)
+        except Exception as e:
+            # Transient error — don't count against the instance
+            log_debug("heartbeat check failed (transient)",
+                      instance_id=instance_id, error=str(e))
+            return False
+
         is_alive = info is not None
 
         with self._lock:

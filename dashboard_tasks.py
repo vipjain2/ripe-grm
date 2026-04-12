@@ -94,6 +94,31 @@ class TasksMixin:
             return candidates
         return _gather(_TRAINING_DIR, recurse=True)
 
+    def _stopped_summary(self, run: "TrainingRun") -> list[str]:
+        """Build summary lines for a stopped/killed/error run."""
+        lines = ["", "─── Run Summary ───"]
+        # Latest checkpoint
+        candidates = [c for c in self._checkpoints(run.run_name) if "_latest" not in c.stem]
+        if candidates:
+            latest_ckpt = max(candidates, key=lambda p: p.stat().st_mtime)
+            lines.append(f"  checkpoint: {latest_ckpt.name}")
+        else:
+            lines.append("  checkpoint: (none)")
+        # Trained iterations
+        trained = run.steps + run.steps_offset
+        lines.append(f"  trained iterations: {trained:,}")
+        # Params
+        params = self._params_for_run(run.run_name)
+        defaults = dict(_load_defaults())
+        for k, v in params.items():
+            if k in ("run_name", "status"):
+                continue
+            default = defaults.get(k)
+            marker = "" if default is not None and v == default else " *"
+            lines.append(f"  {k}: {v}{marker}")
+        lines.append("───────────────────")
+        return lines
+
     def _params_for_run(self, run_name: str) -> dict:
         if _OUTPUT_DIR:
             candidates = list(_OUTPUT_DIR.glob(f"{run_name}_*.json")) + list(_OUTPUT_DIR.glob(f"{run_name}.json"))
@@ -245,6 +270,11 @@ class TasksMixin:
             return
         self.selected_idx = idx
         self.selected_run_name = run.run_name
+        # Add summary for restored stopped runs that don't have one yet
+        if run.status in ("stopped", "killed", "error") and not any(
+            "Run Summary" in l for l in run.log_lines[-25:]
+        ):
+            run.log_lines.extend(self._stopped_summary(run))
         log = self.query_one("#log-view", Log)
         log.clear()
         for line in run.log_lines[-500:]:
