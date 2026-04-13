@@ -261,9 +261,9 @@ class BackendClient:
     def __init__(self, sock_path: str):
         self._sock_path = sock_path
 
-    def _request(self, cmd: str) -> str:
+    def _request(self, cmd: str, timeout: float = 5.0) -> str:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
+        sock.settimeout(timeout)
         sock.connect(self._sock_path)
         sock.sendall((cmd + "\n").encode())
         buf = b""
@@ -308,6 +308,30 @@ class BackendClient:
 
     def query_job(self, gpu_id: int) -> "SocketJobHandle | None":
         resp = self._request(f"query_job {gpu_id}")
+        if resp == "null" or resp.startswith("error"):
+            return None
+        d = json.loads(resp)
+        return SocketJobHandle(d["run_name"], d["gpu_id"], d["log_file"],
+                               d["id"], d["sock_path"], d["backend_id"])
+
+    def reattach(self, run_name: str, gpu_id: int, instance_id: str,
+                 log_file: str = "") -> "SocketJobHandle | None":
+        """Restore a slot from a persisted runs_state.json entry after a
+        dashboard restart. The backend verifies the instance still exists,
+        rebuilds SSH, and either resumes tracking a live training process
+        or flips the slot into 'downloading' so the final log + checkpoint
+        download path runs. Returns a handle on success, None if the
+        instance is gone or restore failed.
+        """
+        payload = json.dumps({
+            "run_name":    run_name,
+            "gpu_id":      gpu_id,
+            "instance_id": instance_id,
+            "log_file":    log_file,
+        })
+        # Reattach does a cloud API call + an SSH pgrep probe — allow
+        # generous headroom vs the default 5s request timeout.
+        resp = self._request(f"reattach {payload}", timeout=60.0)
         if resp == "null" or resp.startswith("error"):
             return None
         d = json.loads(resp)

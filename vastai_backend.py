@@ -35,7 +35,6 @@ from pathlib import Path
 
 from vastai_sdk import VastAI
 
-from ripe_grm.compute_backend_client import SocketJobHandle
 from ripe_grm.compute_backend_server import _BackendServer, _BaseGPUServer
 
 DEFAULT_VAST_SOCK = "/tmp/drl_vast_backend.sock"
@@ -299,39 +298,48 @@ class _VastGPUServer(_BaseGPUServer):
 
     # -- Session restore -----------------------------------------------------
 
-    def register_job(self, run_name: str, job_id: str,
-                     log_file: str) -> "SocketJobHandle | None":
-        """Re-attach to a Vast.ai instance that survived a dashboard restart."""
-        info = _get_instance(job_id)
-        if not info or info.get("actual_status") != "running":
-            return None
-        ssh = InstanceSSH.from_instance(info)
-        # Check training process is actually running — instance alive != job alive
-        training_alive = False
-        try:
-            out = ssh.run(f"pgrep -fa 'train.py' | grep -- '--run-name {run_name}' || true",
-                          timeout=15)
-            training_alive = bool(out.strip())
-        except Exception:
-            training_alive = True  # SSH failed; assume alive, poll will correct
-        if not training_alive:
-            return None
+    def _build_ssh_from_info(self, info: dict) -> InstanceSSH:
+        return InstanceSSH.from_instance(info)
+
+    def _apply_restored_state(self, instance_id: str, ssh: InstanceSSH,
+                              run_name: str, info: dict, entry: dict,
+                              training_alive: bool) -> None:
+        """Hook called by _BaseGPUServer._restore_from_state after the pgrep
+        probe. Writes restored slot state under self._lock. If the training
+        process is no longer alive on the pod, drop straight to "downloading"
+        so the next poll tick runs the final log + checkpoint download path.
+        """
+        # Wipe any leftover local log from a prior session — we'll re-fetch
+        # from the remote log_offset=0 so lines aren't duplicated.
+        Path(self._local_log).unlink(missing_ok=True)
         with self._lock:
-            self._instance_id     = job_id
+            self._instance_id     = instance_id
             self._instance_state  = self.INSTANCE_RUNNING
             self._absent_polls    = 0
             self._ssh             = ssh
-            self._remote_log      = log_file
             self._run_name        = run_name
             self._log_file        = self._local_log
+            self._remote_log      = ""   # rediscovered by _poll step 3
             self._cost_per_hour   = float(info.get("dph_total", 0.0))
-            self._training_status = "running"
+            self._total_cost      = _instance_total_cost(instance_id)
             self._submitted_at    = 0.0
             self._absent_training = 0
             self._ssh_fail_polls  = 0
             self._log_offset      = 0
             self._log_complete    = False
-        return self._make_handle()
+            if training_alive:
+                self._training_status = "running"
+            else:
+                # Pod idle — pgrep showed no train.py for this run_name. Jump
+                # directly to downloading; _poll step 5 handles the final log
+                # fetch + checkpoint SCP and then _on_job_ended() fires.
+                self._training_status = "downloading"
+
+    # register_job is intentionally not overridden. The base-class default
+    # returns None — the register_existing socket path is only exercised by
+    # dashboard._attach_running_processes, which scans local nvidia-smi and
+    # never finds processes on remote pods. Dashboard restart for cloud
+    # slots is handled by the reattach command via _restore_from_state.
 
     # -- Discover extra fields -----------------------------------------------
 
@@ -429,6 +437,13 @@ class _VastGPUServer(_BaseGPUServer):
             # Only when in "running" state — in "submitted" state the process
             # may not have started yet, and a broad scan could pick up a stale
             # process from a previous run, overwriting the newly submitted name.
+            #
+            # The broad scan also acts as a confirmation signal: if the
+            # specific pgrep returned empty but train.py is still running on
+            # the pod, the specific check almost certainly had a transient
+            # miss (e.g. a brief uv→python cmdline blip during JAX compile).
+            # Reclassify as "unknown" (None) so we retain state instead of
+            # marching the absent counter toward "downloading".
             detected_name: str | None = None
             if process_found is False and training_status == "running":
                 try:
@@ -438,7 +453,17 @@ class _VastGPUServer(_BaseGPUServer):
                     if broad_out.strip():
                         parts = broad_out.strip().split()
                         if "--run-name" in parts:
-                            detected_name = parts[parts.index("--run-name") + 1]
+                            seen = parts[parts.index("--run-name") + 1]
+                            if seen == run_name:
+                                # Same run still alive — specific pgrep blipped
+                                process_found = None
+                            else:
+                                detected_name = seen
+                        else:
+                            # train.py present but couldn't parse run-name —
+                            # retain state, better to wait one more poll than
+                            # fast-track a healthy process to "downloading".
+                            process_found = None
                 except Exception as e:
                     log_debug("Broad process scan failed", instance_id=instance_id,
                               error=str(e))
@@ -470,8 +495,16 @@ class _VastGPUServer(_BaseGPUServer):
                                 self._run_name        = None
                                 self._log_file        = ""
                         elif training_status == "running":
+                            # Threshold of 5 (~25s with default poll interval)
+                            # gives JAX JIT compile and other CPU-pinning
+                            # startup work room to breathe before we conclude
+                            # the run actually ended. Combined with the broad
+                            # scan reclassifying transient pgrep misses as
+                            # "unknown", this kills the class of bugs where a
+                            # healthy training process gets prematurely flipped
+                            # to "downloading".
                             self._absent_training += 1
-                            if self._absent_training >= 2:
+                            if self._absent_training >= 5:
                                 self._training_status = "downloading"
                     is_training_alive = self._training_status in ("submitted", "running")
 

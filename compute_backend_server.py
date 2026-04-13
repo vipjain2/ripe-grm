@@ -1,16 +1,21 @@
 """Common server-side infrastructure shared across compute backends.
 
 _BaseGPUServer  — socket loop and protocol skeleton. Backends subclass this
-                  and implement the four hardware-specific commands plus three
-                  job-state helpers. Lock invariant: _job_alive(), _job_id(),
-                  and _make_handle() must always be called with self._lock held.
+                  and implement the four hardware-specific commands plus the
+                  two job-state helpers (_job_alive, _job_id). Cloud slots
+                  additionally override _build_ssh_from_info and
+                  _apply_restored_state so the reattach path can rebuild
+                  their state after a dashboard restart. Lock invariant:
+                  _job_alive(), _job_id(), and _make_handle() must always
+                  be called with self._lock held.
 
-_BackendServer  — backend-level socket server for discovery and state queries.
+_BackendServer  — backend-level socket server for discovery, running-job
+                  queries, and the dashboard-driven `reattach` command.
                   Works with any dict[int, _BaseGPUServer].
 
-_BaseBackend    — state persistence mixin (save/restore running job list).
-                  Concrete backends must set self._servers and self._state_file
-                  before calling _restore_state().
+State persistence lives on the dashboard side (runs_state.json). Backends
+are stateless on disk; they rebuild slot state on each restart via
+_attach_untracked_instances (discovery) and _cmd_reattach (dashboard replay).
 """
 
 from __future__ import annotations
@@ -240,11 +245,108 @@ class _BaseGPUServer(ABC):
 
     # -- Abstract interface --------------------------------------------------
 
-    @abstractmethod
     def register_job(self, run_name: str, job_id: str,
                      log_file: str) -> "SocketJobHandle | None":
-        """Re-attach to an already-running job. Returns None if the job is gone."""
-        ...
+        """Re-attach to an already-running job by opaque job id.
+
+        Used by the `register_existing` socket command, which is driven by
+        dashboard._attach_running_processes — a scan of local nvidia-smi
+        compute-apps. Only the local backend overrides this; cloud backends
+        never see a local PID for a remote pod, so the default no-op applies.
+        Dashboard-restart reattach for cloud slots goes through `_cmd_reattach`
+        / `_restore_from_state` instead.
+        """
+        return None
+
+    # -- Session restore (cloud backends) ------------------------------------
+    #
+    # Called when the dashboard restarts and replays saved runs_state.json
+    # entries via _cmd_reattach. Each cloud slot verifies the instance still
+    # exists, rebuilds SSH, probes whether the training process is alive, and
+    # either resumes normal polling ("running") or jumps straight into the
+    # log+checkpoint download path ("downloading") so the run can finalize
+    # cleanly even though we missed its actual exit.
+
+    def _build_ssh_from_info(self, info: dict):
+        """Rebuild a backend-specific SSH connection from provider instance info.
+        Cloud backends override. Local backend does not use this."""
+        raise NotImplementedError
+
+    def _apply_restored_state(self, instance_id: str, ssh, run_name: str,
+                              info: dict, entry: dict,
+                              training_alive: bool) -> None:
+        """Write restored state onto the slot. Called by _restore_from_state
+        with the SSH-probed liveness verdict. Cloud backends override to set
+        provider-specific fields (cost, remote_log, etc). MUST acquire
+        self._lock internally."""
+        raise NotImplementedError
+
+    def _restore_from_state(self, entry: dict) -> "SocketJobHandle | None":
+        """Generic cloud-slot restore path.
+
+        1. Verify instance alive via _check_instance_alive
+        2. Rebuild SSH via _build_ssh_from_info
+        3. Probe pgrep for the saved run_name
+        4. _apply_restored_state sets slot fields; if pgrep showed dead,
+           state goes directly to "downloading" so the next poll tick runs
+           the final log + checkpoint download path.
+        Returns a handle on success, None if the instance is gone or restore
+        failed at any step.
+        """
+        instance_id = entry.get("instance_id")
+        run_name    = entry.get("run_name")
+        if not instance_id or not run_name:
+            return None
+
+        try:
+            info = self._check_instance_alive(str(instance_id))
+        except Exception as e:
+            log_debug("restore: instance verify failed (transient)",
+                      instance_id=instance_id, error=str(e), gpu_index=self._index)
+            return None
+        if info is None:
+            log_debug("restore: instance gone", instance_id=instance_id,
+                      gpu_index=self._index)
+            return None
+
+        try:
+            ssh = self._build_ssh_from_info(info)
+        except Exception as e:
+            log_error("restore: SSH build failed", instance_id=instance_id,
+                      error=str(e), gpu_index=self._index)
+            return None
+
+        training_alive = False
+        try:
+            out = ssh.run(
+                f"pgrep -fa 'train.py' | grep -E -- '--run-name {run_name}( |$)' || true",
+                timeout=15)
+            training_alive = bool(out.strip())
+        except Exception as e:
+            # SSH check failed — uncertain. Assume alive so the normal poll
+            # loop decides; better than prematurely entering download mode.
+            log_debug("restore: pgrep probe failed, assuming alive",
+                      instance_id=instance_id, error=str(e), gpu_index=self._index)
+            training_alive = True
+
+        log_debug("restore: probe result", instance_id=instance_id,
+                  run_name=run_name, training_alive=training_alive,
+                  gpu_index=self._index)
+
+        try:
+            self._apply_restored_state(
+                str(instance_id), ssh, run_name, info, entry, training_alive,
+            )
+        except Exception as e:
+            log_error("restore: _apply_restored_state failed",
+                      instance_id=instance_id, run_name=run_name,
+                      error=str(e), gpu_index=self._index)
+            return None
+
+        with self._lock:
+            if self._job_alive():
+                return self._make_handle()
+        return None
 
     @abstractmethod
     def _job_alive(self) -> bool:
@@ -454,6 +556,8 @@ class _BackendServer:
                 self._cmd_running_jobs(conn)
             elif cmd.startswith("register_existing "):
                 self._cmd_register_existing(conn, cmd[18:])
+            elif cmd.startswith("reattach "):
+                self._cmd_reattach(conn, cmd[9:])
             elif cmd.startswith("query_job "):
                 self._cmd_query_job(conn, cmd[10:])
             else:
@@ -524,6 +628,47 @@ class _BackendServer:
                 "backend_id": self._backend_id,
             }) + "\n").encode())
         except Exception as e:
+            conn.sendall(f"error {e}\n".encode())
+        finally:
+            conn.close()
+
+    def _cmd_reattach(self, conn: socket.socket, json_str: str) -> None:
+        """Restore a slot from a runs_state.json entry persisted by the
+        dashboard. Looks for a slot already holding this instance_id (in case
+        _attach_untracked_instances ran first and attached it as idle); if
+        none, falls back to the saved gpu_id. Returns the restored handle,
+        or null if the instance is gone / restore failed.
+        """
+        try:
+            entry       = json.loads(json_str)
+            instance_id = entry.get("instance_id")
+            gpu_id      = entry.get("gpu_id")
+            target = None
+            if instance_id is not None:
+                for server in self._servers.values():
+                    with server._lock:
+                        if str(server._instance_id) == str(instance_id):
+                            target = server
+                            break
+            if target is None and gpu_id is not None:
+                target = self._servers.get(int(gpu_id))
+            if target is None:
+                conn.sendall(b"null\n")
+                return
+            handle = target._restore_from_state(entry)
+            if handle is None:
+                conn.sendall(b"null\n")
+                return
+            conn.sendall((json.dumps({
+                "run_name":   handle.run_name,
+                "id":         handle.id,
+                "gpu_id":     handle.gpu_id,
+                "log_file":   handle.log_file,
+                "sock_path":  target.sock_path,
+                "backend_id": self._backend_id,
+            }) + "\n").encode())
+        except Exception as e:
+            log_error("_cmd_reattach failed", exc=e)
             conn.sendall(f"error {e}\n".encode())
         finally:
             conn.close()

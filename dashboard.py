@@ -167,8 +167,18 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
         CONFIG_FILE.write_text(json.dumps({"theme": theme}, indent=2))
 
     def _save_state(self) -> None:
-        state = [
-            {
+        state = []
+        for run in self.runs:
+            if run.status != "running":
+                continue
+            # Persist cloud-backend identifiers so _load_state can re-attach
+            # a slot after a dashboard restart even if the training process
+            # has since exited. handle.id is the cloud instance_id for cloud
+            # backends (PID for local — we persist both, reattach is gated
+            # on backend_id at load time).
+            backend_id  = getattr(run.handle, "backend_id", None) if run.handle else None
+            instance_id = run.handle.id if run.handle else None
+            state.append({
                 "run_name":          run.run_name,
                 "gpu_id":            run.gpu_id,
                 "log_file":          run.log_file,
@@ -178,9 +188,9 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
                 "chain_experiment":  run.chain_experiment,
                 "chain_task_idx":    run.chain_task_idx,
                 "chain_total_tasks": run.chain_total_tasks,
-            }
-            for run in self.runs if run.status == "running"
-        ]
+                "backend_id":        backend_id,
+                "instance_id":       instance_id,
+            })
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2)
 
@@ -225,6 +235,33 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
             return
         with open(STATE_FILE) as f:
             state = json.load(f)
+
+        # Cloud-backend reattach. Fresh backends spawned by _start_backend_servers
+        # have no in-memory state, so any cloud entry from runs_state.json must
+        # be replayed explicitly. For each entry with a backend_id + instance_id,
+        # ask the owning backend to verify the instance, SSH in, and either
+        # resume tracking a live process or flip the slot to 'downloading' so
+        # the final log + checkpoint download path runs. Dead entries (instance
+        # gone) return None and fall through to the existing stopped-run path.
+        for entry in state:
+            backend_id  = entry.get("backend_id")
+            instance_id = entry.get("instance_id")
+            if not backend_id or not instance_id:
+                continue
+            backend = _backend_by_id.get(backend_id)
+            if backend is None:
+                continue
+            try:
+                backend.reattach(
+                    run_name    = entry["run_name"],
+                    gpu_id      = entry.get("gpu_id", 0),
+                    instance_id = str(instance_id),
+                    log_file    = entry.get("log_file", ""),
+                )
+            except Exception as e:
+                log_error("reattach failed", backend_id=backend_id,
+                          run_name=entry.get("run_name"), exc=e)
+
         live = live_jobs(_backends)
         seen = {r.run_name for r in self.runs}
         for entry in state:
