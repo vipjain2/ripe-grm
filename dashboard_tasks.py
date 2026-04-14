@@ -41,7 +41,6 @@ class TasksTab(Widget):
     DEFAULT_CSS = "TasksTab { height: 1fr; }"
     BINDINGS = [
         Binding("q", "app.quit",         "Quit"),
-        Binding("c", "app.continue_run", "Continue"),
         Binding("k", "app.kill",         "Kill"),
         Binding("d", "app.delete",       "Delete"),
         Binding("t", "app.tensorboard",  "TensorBoard"),
@@ -71,7 +70,7 @@ class TasksMixin:
     Relies on the host class (Dashboard) providing:
         self.runs, self.selected_run_name, self.selected_idx,
         self._rebuilding_table, self._gpus,
-        self._free_gpu(), self._gpu_by_index(), self._save_state(),
+        self._free_gpu(), self._save_state(),
         self.notify(), self.push_screen(), self.query_one()
     """
 
@@ -105,7 +104,7 @@ class TasksMixin:
         else:
             lines.append("  checkpoint: (none)")
         # Trained iterations
-        trained = run.steps + run.steps_offset
+        trained = run.steps
         if trained == 0:
             lines.append("  trained iterations: 0 (no log data)")
         else:
@@ -150,22 +149,6 @@ class TasksMixin:
         if not self.selected_run_name:
             return None
         return next((r for r in self.runs if r.run_name == self.selected_run_name), None)
-
-    def _last_step_from_tb(self, run_name: str) -> int:
-        try:
-            from tbparse import SummaryReader
-            if _LOG_DIR:
-                log_dir = _LOG_DIR / run_name
-            else:
-                parents = [p.parent for p in _TRAINING_DIR.rglob("events.out.tfevents.*")
-                           if run_name in str(p)]
-                log_dir = parents[0] if parents else None
-            if not log_dir or not Path(log_dir).exists():
-                return 0
-            df = SummaryReader(str(log_dir)).scalars
-            return int(df["step"].max()) if not df.empty else 0
-        except Exception:
-            return 0
 
     # -----------------------------------------------------------------------
     # Tick helpers
@@ -370,33 +353,6 @@ class TasksMixin:
             self.call_from_thread(_finish)
 
         self.run_worker(_do_submit, thread=True)
-
-    def action_continue_run(self) -> None:
-        run = self._selected_run()
-        if run is None:
-            self.notify("No run selected.", severity="error")
-            return
-        if run.status == "running":
-            self.notify("Run is still active — kill it first.", severity="error")
-            return
-        candidates = self._checkpoints(run.run_name)
-        if not candidates:
-            self.notify(f"No checkpoint found for {run.run_name}.", severity="error")
-            return
-        checkpoint = str(max(candidates, key=lambda p: p.stat().st_mtime))
-        config = self._params_for_run(run.run_name)
-        config["run_name"]   = run.run_name
-        fallback_gpu = self._free_gpu()
-        config["gpu_id"]     = run.gpu_id if run.gpu_id is not None else (fallback_gpu.index if fallback_gpu else 0)
-        config["checkpoint"] = checkpoint
-        self.runs.remove(run)
-        steps_offset = self._last_step_from_tb(run.run_name)
-
-        def _on_continued(new_run) -> None:
-            new_run.steps_offset = steps_offset
-            self.notify(f"Continuing {run.run_name} from {Path(checkpoint).name}", timeout=5)
-
-        self._on_spawn_result(config, on_ready=_on_continued)
 
     def action_kill(self) -> None:
         run = self._selected_run()

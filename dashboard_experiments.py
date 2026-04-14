@@ -105,6 +105,10 @@ class AddStepModal(ModalScreen):
     def compose(self):
         defaults    = _load_defaults()
         gpu_options = [("any", "any")] + [(b, b) for b in self._backend_ids]
+        # Guarantee the initial value is a valid option — otherwise Textual's
+        # Select silently drops it and the user's preference is lost on save.
+        if self._initial_gpu_pref not in {v for _, v in gpu_options}:
+            gpu_options.append((self._initial_gpu_pref, self._initial_gpu_pref))
         yield Footer()
         with Vertical(id="spawn-dialog"):
             yield Label(self._title, id="spawn-title")
@@ -150,6 +154,10 @@ class EditExperimentModal(ModalScreen):
     def compose(self):
         defaults = _load_defaults()
         gpu_options = [("any", "any")] + [(b, b) for b in self._backend_ids]
+        # Guarantee the initial value is a valid option — otherwise Textual's
+        # Select silently drops it and the user's preference is lost on save.
+        if self._current_gpu_pref not in {v for _, v in gpu_options}:
+            gpu_options.append((self._current_gpu_pref, self._current_gpu_pref))
         yield Footer()
         with Vertical(id="spawn-dialog"):
             yield Label(f"Edit Experiment: {self._run_name}", id="spawn-title")
@@ -192,7 +200,7 @@ class ExperimentsMixin:
 
     Relies on the host class (Dashboard) providing:
         self.experiment_queue, self.selected_queue_idx, self.runs,
-        self._free_gpu(), self._gpu_by_index(), self._on_spawn_result(),
+        self._free_gpu(), self._on_spawn_result(),
         self._checkpoints(), self.notify(), self.push_screen(), self.query_one()
     """
 
@@ -272,6 +280,10 @@ class ExperimentsMixin:
 
     def _spawn_chain_task_inner(self, run) -> None:
         next_idx = run.chain_task_idx + 1
+        # experiments.json is the ground truth for gpu_preference and params —
+        # reload from disk so each chain step sees any edits made while a
+        # prior step was running.
+        self._load_queue()
         exp = next((e for e in self.experiment_queue if e.get("run_name") == run.chain_experiment), None)
         if exp is None:
             self.notify(f"Chain: experiment '{run.chain_experiment}' not found in queue", severity="error", timeout=10)
@@ -314,7 +326,8 @@ class ExperimentsMixin:
             "backend_id": gpu.backend_id,
             "checkpoint": checkpoint,
         }
-        self.runs.remove(run)
+        # Keep `run` in self.runs as a stopped entry so the completed step
+        # remains visible in the Tasks tab after its successor is launched.
 
         def _set_chain(new_run) -> None:
             new_run.chain_experiment  = run.chain_experiment
@@ -340,9 +353,11 @@ class ExperimentsMixin:
             run_name = exp.get("run_name", "-")
 
             exp_runs = self._exp_runs(run_name)
-            done_run = next(
-                (r for r in exp_runs if r.status in ("stopped", "killed", "error")), None,
-            )
+            # Prefer the latest step's done-run so a multi-step chain shows the
+            # most recent outcome (e.g. step 3/3 errored vs. step 1/3 stopped).
+            done_runs = [r for r in exp_runs if r.status in ("stopped", "killed", "error")]
+            done_run = (max(done_runs, key=lambda r: r.chain_task_idx or 0)
+                        if done_runs else None)
             running_run = next(
                 (r for r in exp_runs if r.status == "running"), None,
             )
@@ -471,15 +486,26 @@ class ExperimentsMixin:
         if task_idx == -1:
             task_idx = 0
 
-        # A step is submitted if any run for this experiment has reached or passed it
-        submitted_up_to = -1
-        existing = next(iter(self._exp_runs(run_name)), None)
-        if existing is not None:
-            submitted_up_to = existing.chain_task_idx
+        # A step is locked only if it's actively running or has successfully
+        # completed on disk (checkpoint meta has status=complete). Steps that
+        # were submitted but failed/killed are free to re-edit — including
+        # their gpu_preference, so the user can retry on a different backend.
+        exp_runs = self._exp_runs(run_name)
+        running_idx = next(
+            (r.chain_task_idx for r in exp_runs if r.status == "running"),
+            None,
+        )
+        completed_up_to = getattr(self, "_disk_completed", {}).get(run_name, -1)
 
-        if task_idx <= submitted_up_to:
+        if task_idx == running_idx:
             self.notify(
-                f"Step {task_idx + 1} has already been submitted — cannot edit.",
+                f"Step {task_idx + 1} is currently running — cannot edit.",
+                severity="warning",
+            )
+            return
+        if task_idx <= completed_up_to:
+            self.notify(
+                f"Step {task_idx + 1} has already completed — cannot edit.",
                 severity="warning",
             )
             return
@@ -495,7 +521,11 @@ class ExperimentsMixin:
         else:
             # Edit an individual step
             current_params   = {k: v for k, v in tasks[task_idx].items() if k in _load_defaults()}
-            current_gpu_pref = tasks[task_idx].get("gpu_preference", "any")
+            # Fall back to experiment-level preference when the task has no
+            # explicit override — the modal shows the *effective* value so
+            # the user doesn't accidentally downgrade to "any" by leaving the
+            # dropdown untouched.
+            current_gpu_pref = tasks[task_idx].get("gpu_preference") or exp.get("gpu_preference", "any")
             self._editing_task_idx = task_idx
             self.push_screen(
                 AddStepModal(self._backend_ids(), initial_params=current_params,
@@ -509,6 +539,10 @@ class ExperimentsMixin:
             return
         exp   = self.experiment_queue[self.selected_queue_idx]
         tasks = exp.get("tasks") or [exp]
+        # AddStepModal returns training params + the gpu_preference the user
+        # selected. Persist the whole dict verbatim — the JSON file is the
+        # single source of truth for gpu_preference, and submit always
+        # reloads the queue from disk before launching.
         tasks[self._editing_task_idx] = params
         exp["tasks"] = tasks
         self._save_queue()
@@ -553,8 +587,12 @@ class ExperimentsMixin:
             self.notify(f"Removed experiment {run_name}", timeout=3)
         else:
             # Removing a specific step — block if that step has already run or is running
-            existing = next(iter(self._exp_runs(run_name)), None)
-            if existing is not None and existing.chain_task_idx >= task_idx:
+            exp_runs = self._exp_runs(run_name)
+            submitted_up_to = max(
+                (r.chain_task_idx for r in exp_runs if r.chain_task_idx is not None),
+                default=-1,
+            )
+            if submitted_up_to >= task_idx:
                 self.notify(f"Step {task_idx + 1} has already run — cannot remove.", severity="warning")
                 return
             tasks = exp.get("tasks") or [exp]
@@ -584,7 +622,21 @@ class ExperimentsMixin:
             self.notify("Select the experiment row (not a step) to submit the chain.", severity="warning")
             return
         self.selected_queue_idx = idx
-        exp      = self.experiment_queue[idx]
+        # experiments.json is the ground truth for gpu_preference and params.
+        # Reload from disk before launching so manual edits to the file (or
+        # stale in-memory state) can't cause a submit to the wrong backend.
+        pre_reload_run_name = self.experiment_queue[idx].get("run_name")
+        self._load_queue()
+        exp = next(
+            (e for e in self.experiment_queue if e.get("run_name") == pre_reload_run_name),
+            None,
+        )
+        if exp is None:
+            self.notify(f"{pre_reload_run_name}: not in experiments.json (removed externally?)",
+                        severity="error")
+            self._refresh_queue_table()
+            return
+        self.selected_queue_idx = self.experiment_queue.index(exp)
         run_name = exp["run_name"]
         tasks    = exp.get("tasks") or [exp]
 

@@ -22,7 +22,6 @@ class TrainingRun:
     log_queue:  queue.Queue = field(default_factory=queue.Queue)
     status:     str = "running"
     steps:      int = 0
-    steps_offset: int = 0
     log_file:   str = ""
     alive_failures:    int = 0
     chain_experiment:  str | None = None

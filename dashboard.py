@@ -184,7 +184,6 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
                 "log_file":          run.log_file,
                 "start_time":        run.start_time,
                 "steps":             run.steps,
-                "steps_offset":      run.steps_offset,
                 "chain_experiment":  run.chain_experiment,
                 "chain_task_idx":    run.chain_task_idx,
                 "chain_total_tasks": run.chain_total_tasks,
@@ -277,7 +276,6 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
                 start_time        = entry.get("start_time", time.time()),
                 status            = "running" if handle else "stopped",
                 steps             = entry.get("steps", 0),
-                steps_offset      = entry.get("steps_offset", 0),
                 log_file          = entry.get("log_file", ""),
                 chain_experiment  = entry.get("chain_experiment"),
                 chain_task_idx    = entry.get("chain_task_idx", 0),
@@ -365,15 +363,6 @@ class Dashboard(App, TasksMixin, ExperimentsMixin):
         self._refresh_gpus()
         used = {r.gpu_id for r in self.runs if r.status == "running" and r.gpu_id is not None}
         return next((g for g in self._gpus if g.index not in used), None)
-
-    def _gpu_by_index(self, idx: int | None) -> "GPU | None":
-        if idx is None:
-            return None
-        found = next((g for g in self._gpus if g.index == idx), None)
-        if found is None:
-            self._refresh_gpus()
-            found = next((g for g in self._gpus if g.index == idx), None)
-        return found
 
     # -----------------------------------------------------------------------
     # Tick
