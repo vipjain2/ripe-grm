@@ -273,7 +273,17 @@ class BackendClient:
                 break
             buf += chunk
         sock.close()
-        return buf.decode().strip()
+        resp = buf.decode().strip()
+        if not resp:
+            # Server closed the connection without writing. Surface a clear
+            # error rather than returning "" and crashing the caller in
+            # json.loads(""). The server-side _handle_client was updated to
+            # always send an "error server exception: ..." response on
+            # unhandled exceptions, so an empty response indicates a
+            # protocol-level failure (socket death, partial send, etc.).
+            raise RuntimeError(
+                f"empty response from backend {self._sock_path!r} for cmd {cmd!r}")
+        return resp
 
     def info(self) -> dict:
         """Return backend metadata: backend_id, gpu_count, host."""

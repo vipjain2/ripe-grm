@@ -85,7 +85,19 @@ def _connect_backends() -> list[BackendClient]:
 
 
 def live_jobs(backends: list[BackendClient]) -> dict:
-    return {h.run_name: h for h in (j for b in backends for j in b.running_jobs())}
+    """Return {run_name: handle} for all running jobs across every backend.
+
+    Per-backend failures (socket errors, server exceptions) are logged and
+    skipped so one flaky backend can't block dashboard startup.
+    """
+    live: dict = {}
+    for b in backends:
+        try:
+            for h in b.running_jobs():
+                live[h.run_name] = h
+        except Exception as e:
+            log_error("running_jobs failed", sock_path=b._sock_path, exc=e)
+    return live
 
 
 def init_backends() -> tuple[list[BackendClient], dict[str, BackendClient], list[GPU], int]:
